@@ -1,0 +1,34 @@
+{
+  "name": "@slot0/forky",
+  "version": "0.1.0",
+  "publishConfig": {
+    "access": "public",
+    "tag": "latest"
+  },
+  "description": "Fast and efficient EVM forks",
+  "keywords": [],
+  "module": "./lib.esm/index.js",
+  "sideEffects": false,
+  "author": "jan@slot0.io",
+  "main": "index.node",
+  "scripts": {
+    "test": "cargo test",
+    "cargo-build": "cargo build --message-format=json > cargo.log",
+    "cross-build": "cross build --message-format=json > cross.log",
+    "postcargo-build": "neon dist < cargo.log",
+    "postcross-build": "neon dist -m /target < cross.log",
+    "debug": "npm run cargo-build --",
+    "build": "npm run cargo-build -- --release",
+    "cross": "npm run cross-build -- --release"
+  },
+  "type": "commonjs",
+  "types": "types.d.ts",
+  "files": [
+    "index.node",
+    "types.d.ts"
+  ],
+  "license": "ISC",
+  "devDependencies": {
+    "@neon-rs/cli": "0.1.73"
+  }
+}
