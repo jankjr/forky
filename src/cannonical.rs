@@ -580,6 +580,15 @@ impl CannonicalFork {
         if let TryResult::Present(acc) = self.accounts.try_get(&address) {
             return Ok(Some(acc.clone()));
         }
+        {
+            self.load_positions(vec![(
+                address.clone(),
+                (0u64..10u64)
+                    .map(|i| revm::primitives::U256::from(i))
+                    .collect::<Vec<revm::primitives::U256>>(),
+            )])
+            .await?;
+        }
         Ok(Some(self.fetch_basic_from_remote(address).await?))
     }
     async fn code_by_hash(

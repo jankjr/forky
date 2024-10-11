@@ -122,7 +122,7 @@ impl ApplicationState {
     }
 
     async fn fork_db<'a>(&self) -> eyre::Result<ActiveForkRef> {
-        if *self.desynchronized.read().await == true {
+        if self.desynchronized.read().await.eq(&true) {
             return Err(eyre::eyre!("Simulator desynchronized, please create new simulator"));
         }
         // Forks the current state of the cannonical fork into into a new EVM instance with
@@ -151,7 +151,7 @@ impl ApplicationState {
         &self,
         latest_block: u64,
     ) -> eyre::Result<()> {
-        if *self.desynchronized.read().await == true {
+        if self.desynchronized.read().await.eq(&true) {
             return Err(eyre::eyre!("Simulator desynchronized, please create new simulator"));
         }
         
@@ -954,11 +954,14 @@ fn create_preload_fn<'a>(
             
             if addreses.len() == 1 {
                 db.preload.insert(addreses[0]);
+                deferred.settle_with(&channel, |mut cx|{
+                    JsResult::Ok(cx.undefined())
+                });
             } else if addreses.len() > 1 {
                 let positions = addreses.into_iter().map(|v| {
                     (
                         v,
-                        (0u64..25u64)
+                        (0u64..10u64)
                                 .map(|i| revm::primitives::U256::from(i))
                                 .chain(DEFAULT_SLOTS.iter().map(|v| v.clone()).collect::<Vec<revm::primitives::U256>>())
                                 .collect::<Vec<revm::primitives::U256>>()
