@@ -635,17 +635,6 @@ impl CannonicalFork {
                 return Ok(acc.clone());
             }
         };
-        if let TryResult::Absent = self.pending_storage_reads.try_get(&(address, index)) {
-            let out = tokio::try_join!(
-                self.fetch_storage(address, index),
-                self.fetch_storage(address, index + revm::primitives::ruint::Uint::from(1u64)),
-                self.fetch_storage(address, index + revm::primitives::ruint::Uint::from(2u64)),
-                self.fetch_storage(address, index + revm::primitives::ruint::Uint::from(3u64)),
-                self.fetch_storage(address, index + revm::primitives::ruint::Uint::from(4u64)),
-                self.fetch_storage(address, index + revm::primitives::ruint::Uint::from(5u64)),
-            )?;
-            return Ok(out.0);
-        }
         return Ok(self.fetch_storage(address, index).await?);
     }
     async fn block_hash(&self, num: u64) -> eyre::Result<prims::B256> {
