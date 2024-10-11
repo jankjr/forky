@@ -220,11 +220,7 @@ fn runtime<'a, C: Context<'a>>(cx: &mut C) -> NeonResult<&'static Runtime> {
     static RUNTIME: OnceCell<Runtime> = OnceCell::new();
 
     RUNTIME.get_or_try_init(|| {
-        if std::env::var_os("RUST_LOG").is_none() {
-            std::env::set_var("RUST_LOG", "slot0::api");
-        }
-        log::set_max_level(log::LevelFilter::Debug);
-        pretty_env_logger::init();
+        
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(4)
@@ -1255,7 +1251,12 @@ fn create_simulator(mut cx: FunctionContext) -> JsResult<JsPromise> {
 
 #[neon::main]
 pub fn main(mut cx: ModuleContext) -> NeonResult<()> {
-    runtime(&mut cx)?;
+    if std::env::var_os("RUST_LOG").is_none() {
+        std::env::set_var("RUST_LOG", "slot0::api");
+    }
+    log::set_max_level(log::LevelFilter::Debug);
+    pretty_env_logger::init();
+    
     cx.export_function("createSimulator", create_simulator)?;
     NeonResult::Ok(())
 }
