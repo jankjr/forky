@@ -1252,11 +1252,11 @@ fn create_simulator(mut cx: FunctionContext) -> JsResult<JsPromise> {
 #[neon::main]
 pub fn main(mut cx: ModuleContext) -> NeonResult<()> {
     if std::env::var_os("RUST_LOG").is_none() {
-        std::env::set_var("RUST_LOG", "slot0::api");
+        std::env::set_var("RUST_LOG", LOGGER_TARGET_MAIN);
     }
     log::set_max_level(log::LevelFilter::Debug);
     pretty_env_logger::init();
-    
+
     cx.export_function("createSimulator", create_simulator)?;
     NeonResult::Ok(())
 }

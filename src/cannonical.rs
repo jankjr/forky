@@ -13,6 +13,7 @@ use alloy::{
         },
         Block,
     },
+    signers::k256::U256,
     transports::BoxTransport,
 };
 use alloy_provider::{
@@ -633,19 +634,19 @@ impl CannonicalFork {
             if let TryResult::Present(acc) = acc.try_get(&index) {
                 return Ok(acc.clone());
             }
+        };
+        if let TryResult::Absent = self.pending_storage_reads.try_get(&(address, index)) {
+            let out = tokio::try_join!(
+                self.fetch_storage(address, index),
+                self.fetch_storage(address, index + revm::primitives::ruint::Uint::from(1u64)),
+                self.fetch_storage(address, index + revm::primitives::ruint::Uint::from(2u64)),
+                self.fetch_storage(address, index + revm::primitives::ruint::Uint::from(3u64)),
+                self.fetch_storage(address, index + revm::primitives::ruint::Uint::from(4u64)),
+                self.fetch_storage(address, index + revm::primitives::ruint::Uint::from(5u64)),
+            )?;
+            return Ok(out.0);
         }
-        if index.gt(&revm::primitives::U256::from(25u64)) {
-            let slots = (0u64..5u64)
-                .map(|i| revm::primitives::U256::from(i) + index.clone())
-                .collect::<Vec<revm::primitives::U256>>();
-            self.load_positions(vec![(address, slots)]).await?;
-            if let TryResult::Present(acc) = self.storage.try_get(&address) {
-                if let TryResult::Present(acc) = acc.try_get(&index) {
-                    return Ok(acc.clone());
-                }
-            }
-        }
-        Ok(self.fetch_storage(address, index).await?)
+        return Ok(self.fetch_storage(address, index).await?);
     }
     async fn block_hash(&self, num: u64) -> eyre::Result<prims::B256> {
         match self.block_hashes.entry(num) {
