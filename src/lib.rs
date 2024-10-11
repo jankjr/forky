@@ -10,6 +10,7 @@ use neon::handle::Handle;
 use neon::object::Object;
 use neon::prelude::{Context, FunctionContext, ModuleContext, TaskContext};
 use neon::result::{self, JsResult, NeonResult};
+use neon::types::JsArray;
 use neon::types::JsUndefined;
 use neon::types::Value;
 use neon::types::{JsBigInt, JsFunction, JsNumber, JsObject, JsPromise, JsString, JsValue};
@@ -76,25 +77,8 @@ fn bigint_to_u256<'a>(
 }
 
 
-const RTOKEN_SLOTS: [revm::primitives::U256; 20] = [
-    revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!("a7ce836d032b2bf62b7e2097a8e0a6d8aeb35405ad15271e96d3b0188a1d06fc")),
-    revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!("a7ce836d032b2bf62b7e2097a8e0a6d8aeb35405ad15271e96d3b0188a1d06fb")),
-    revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!("a7ce836d032b2bf62b7e2097a8e0a6d8aeb35405ad15271e96d3b0188a1d0706")),
-    revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!("a7ce836d032b2bf62b7e2097a8e0a6d8aeb35405ad15271e96d3b0188a1d0707")),
-    revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!("a7ce836d032b2bf62b7e2097a8e0a6d8aeb35405ad15271e96d3b0188a1d0700")),
-    revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!("a7ce836d032b2bf62b7e2097a8e0a6d8aeb35405ad15271e96d3b0188a1d0704")),
-    revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!("cb")),
-    revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!("cd")),
-    revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!("97")),
-    revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!("b53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103")),
-    revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!("a7ce836d032b2bf62b7e2097a8e0a6d8aeb35405ad15271e96d3b0188a1d06ff")),
-    revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!("a7ce836d032b2bf62b7e2097a8e0a6d8aeb35405ad15271e96d3b0188a1d06fd")),
-    revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!("a7ce836d032b2bf62b7e2097a8e0a6d8aeb35405ad15271e96d3b0188a1d0701")),
-    revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!("a7ce836d032b2bf62b7e2097a8e0a6d8aeb35405ad15271e96d3b0188a1d0703")),
-    revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!("a7ce836d032b2bf62b7e2097a8e0a6d8aeb35405ad15271e96d3b0188a1d0702")),
-    revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!("a7ce836d032b2bf62b7e2097a8e0a6d8aeb35405ad15271e96d3b0188a1d0705")),
-    revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!("a7ce836d032b2bf62b7e2097a8e0a6d8aeb35405ad15271e96d3b0188a1d06fe")),
-    revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!(
+const DEFAULT_SLOTS: [revm::primitives::U256; 3] = [
+   revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!(
         "7050c9e0f4ca769c69bd3a8ef740bc37934f8e2c036e5a723fd8ee048ed3f8c3"
     )),
     revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!(
@@ -378,7 +362,7 @@ impl revm::Inspector<&mut CacheDB<Forked>> for LogTracer {
         if opcode == 0x54 {
             let address = interp.contract().target_address;
             let loc = interp.stack.peek(0).unwrap_or_default();
-            if RTOKEN_SLOTS.contains(&loc) {
+            if DEFAULT_SLOTS.contains(&loc) {
                 return;
             }
             self.memory_reads
@@ -460,7 +444,7 @@ fn instantiate_run_tx<'a>(
                             v,
                             (0u64..10u64)
                                 .map(|i| revm::primitives::U256::from(i))
-                                .chain(RTOKEN_SLOTS.iter().map(|v| v.clone()).collect::<Vec<revm::primitives::U256>>())
+                                .chain(DEFAULT_SLOTS.iter().map(|v| v.clone()).collect::<Vec<revm::primitives::U256>>())
                                 .collect::<Vec<revm::primitives::U256>>()
                         )
                     })
@@ -526,7 +510,7 @@ fn instantiate_run_tx<'a>(
 
                 match result {
                     std::result::Result::Err(e) => {
-                        log::error!(target: LOGGER_TARGET_MAIN, "Failed to revert to checkpoint: {}", e);
+                        log::error!(target: LOGGER_TARGET_MAIN, "EVM error: {}", e);
                         deferred.settle_with(&channel, move |mut cx: TaskContext<'_>| {
                             let err = cx.error(e.to_string())?;
                             cx.throw::<_, Handle<'_, JsUndefined>>(err)
@@ -951,17 +935,48 @@ fn create_preload_fn<'a>(
     JsFunction::new(cx, move |mut cx: FunctionContext| {
         let db = db.clone();
 
-        let address = cx.argument(0)?;
+        let addresses = cx.argument::<JsArray>(0)?;
 
-        let address = js_value_to_address(&mut cx, address)?;
+        let length = addresses.len(&mut cx);
+        let mut addreses = Vec::with_capacity(length as usize);
+        for i in 0..length {
+            let address = addresses.get(&mut cx, i)?;
+            let address = js_value_to_address(&mut cx, address)?;
+            addreses.push(address);
+        }
         let rt: &Runtime = runtime(&mut cx)?;
-
+        let channel = cx.channel();
+        let (deferred, p) = cx.promise();
         rt.spawn(async move {
             let db = db.clone();
-            db.preload.insert(address);
-        });
+            
+            if addreses.len() == 1 {
+                db.preload.insert(addreses[0]);
+            } else if addreses.len() > 1 {
+                let positions = addreses.into_iter().map(|v| {
+                    (
+                        v,
+                        (0u64..25u64)
+                                .map(|i| revm::primitives::U256::from(i))
+                                .chain(DEFAULT_SLOTS.iter().map(|v| v.clone()).collect::<Vec<revm::primitives::U256>>())
+                                .collect::<Vec<revm::primitives::U256>>()
+                    )
+                }).collect::<Vec<_>>();
 
-        JsResult::Ok(cx.undefined())
+                match db.cannonical.load_positions(
+                    positions
+                ).await {
+                    eyre::Result::Err(e) => {
+                        log::error!(target: LOGGER_TARGET_MAIN, "Failed to preload {}", e)
+                    }
+                    _ => {}
+                }
+                deferred.settle_with(&channel, |mut cx|{
+                    JsResult::Ok(cx.undefined())
+                });
+            }
+        });
+        JsResult::Ok(p)
     })
 }
 

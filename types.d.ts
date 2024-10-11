@@ -64,7 +64,7 @@ export interface SimulatorFork {
 export interface ForkySimulator {
     onBlock: (blockNumber: number) => Promise<void>;
     fork: () => Promise<SimulatorFork>;
-    preload: (address: string) => void;
+    preload: (address: string[]) => Promise<void>;
 }
 
 /**

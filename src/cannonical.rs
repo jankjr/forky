@@ -206,7 +206,6 @@ impl CannonicalFork {
         Ok(())
     }
 
-
     pub async fn block_env(&self) -> revm::primitives::BlockEnv {
         let block = self.current_block.read().await;
         revm::primitives::BlockEnv {
@@ -633,6 +632,17 @@ impl CannonicalFork {
         if let TryResult::Present(acc) = self.storage.try_get(&address) {
             if let TryResult::Present(acc) = acc.try_get(&index) {
                 return Ok(acc.clone());
+            }
+        }
+        if index.gt(&revm::primitives::U256::from(25u64)) {
+            let slots = (0u64..5u64)
+                .map(|i| revm::primitives::U256::from(i) + index.clone())
+                .collect::<Vec<revm::primitives::U256>>();
+            self.load_positions(vec![(address, slots)]).await?;
+            if let TryResult::Present(acc) = self.storage.try_get(&address) {
+                if let TryResult::Present(acc) = acc.try_get(&index) {
+                    return Ok(acc.clone());
+                }
             }
         }
         Ok(self.fetch_storage(address, index).await?)
