@@ -482,10 +482,15 @@ fn instantiate_run_tx<'a>(
                 let out: Evm<'_, LogTracer, &mut CacheDB<Forked>> = revm::Evm::builder()
                     .with_block_env(env)
                     .with_db(inner_db)
+                    .modify_cfg_env(|f|{
+                        f.memory_limit = 1024 * 1024 * 64;
+                        f.disable_eip3607 = true;
+                    })
                     .with_external_context(tracer)
                     .append_handler_register(revm::inspector_handle_register)
                     .with_spec_id(revm::primitives::SpecId::CANCUN)
                     .build();
+
 
                 let start_time = std::time::Instant::now();
                 let mut simulation_runner = out
@@ -503,6 +508,7 @@ fn instantiate_run_tx<'a>(
                     })
                     .build();
 
+                    
                 let result = simulation_runner.transact_commit();
 
                 let end_time = std::time::Instant::now();
