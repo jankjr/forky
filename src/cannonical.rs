@@ -13,7 +13,6 @@ use alloy::{
         },
         Block,
     },
-    signers::k256::U256,
     transports::BoxTransport,
 };
 use alloy_provider::{
