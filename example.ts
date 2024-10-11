@@ -32,6 +32,7 @@ const run = async () => {
             // Called if any logs are emitted during the execution
         }
     )
+
     console.log("Alice balance:", await fork.getBalance(alice));
     console.log("Bob balance:", await fork.getBalance(bob));
 

@@ -1,8 +1,6 @@
 use alloy::{
-    consensus::TxEnvelope,
     eips::BlockId,
-    hex::{FromHex, ToHexExt},
-    pubsub::PubSubFrontend,
+    hex::FromHex,
     rpc::types::{
         trace::{
             common::TraceResult,
@@ -579,7 +577,7 @@ impl CannonicalFork {
         };
     }
 
-    async fn basic(&self, address: Address) -> eyre::Result<Option<AccountInfo>> {
+    pub async fn basic(&self, address: Address) -> eyre::Result<Option<AccountInfo>> {
         if let TryResult::Present(acc) = self.accounts.try_get(&address) {
             return Ok(Some(acc.clone()));
         }
@@ -627,7 +625,7 @@ impl CannonicalFork {
         }
     }
 
-    async fn storage(
+    pub async fn storage(
         &self,
         address: Address,
         index: revm::primitives::ruint::Uint<256, 4>,

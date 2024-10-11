@@ -56,6 +56,7 @@ export interface SimulatorFork {
     setTimestamp: (timestamp:  number) => Promise<void>;
     setBalance: (address: string, balance: bigint) => Promise<void>;
     setContractStorage: (address: string, key: bigint, value: bigint) => Promise<void>;
+    getStorageAt: (address: string, key: bigint) => Promise<bigint>;
     getBalance: (address: string) => Promise<bigint>;
     preload: (address: string) => void;
 }

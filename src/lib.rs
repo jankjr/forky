@@ -18,6 +18,7 @@ use revm::db::CacheDB;
 use revm::primitives::ExecutionResult;
 use revm::primitives::U256;
 use revm::primitives::{hex, TransactTo};
+use revm::DatabaseRef;
 use revm::{primitives::Address, Evm};
 
 use once_cell::sync::OnceCell;
@@ -885,6 +886,38 @@ fn instantiate_get_balance_fn<'a>(
     })
 }
 
+
+fn instantiate_get_storage_at_fn<'a>(
+    cx: &mut TaskContext<'a>, // evm: Arc<Evm<'a,(), CacheDB<Forked>>>,
+    db: ActiveForkRef,
+) -> JsResult<'a, JsFunction> {
+    let db = db.clone();
+    JsFunction::new(cx, move |mut cx: FunctionContext| {
+        let db = db.clone();
+        let channel = cx.channel();
+
+        let address = cx.argument(0)?;
+        let address = js_value_to_address(&mut cx, address)?;
+        let position = cx.argument(1)?;
+        let position = js_value_to_uint256(&mut cx, position)?;
+
+        let (deferred, promise) = cx.promise();
+        runtime(&mut cx)?.spawn(async move {
+            let forked = db.lock().await;
+            let value = forked.db.storage_ref(address, position);
+            deferred.settle_with(&channel, move |mut cx: TaskContext| {
+                let acc  = to_neon(&mut cx, value)?;
+                
+                let n = acc.as_limbs();
+                let out = JsBigInt::from_digits_le(&mut cx,neon::types::bigint::Sign::Positive, n.as_slice()); 
+                NeonResult::Ok(out)
+            })
+        });
+
+        JsResult::Ok(promise)
+    })
+}
+
 fn init_preload_addr_fn<'a>(
     cx: &mut TaskContext<'a>, // evm: Arc<Evm<'a,(), CacheDB<Forked>>>,
     db: ActiveForkRef,
@@ -1043,6 +1076,9 @@ fn init_fork_js_obj<'a>(
 
     let get_balance_fn = { instantiate_get_balance_fn(cx, db.clone())? };
     obj.set(cx, "getBalance", get_balance_fn)?;
+    
+    let get_storage_fn = { instantiate_get_storage_at_fn(cx, db.clone())? };
+    obj.set(cx, "getStorageAt", get_storage_fn)?;
 
     let set_storage_fn: Handle<'_, JsFunction> = { instantiate_set_storage_fn(cx, db.clone())? };
     obj.set(cx, "setContractStorage", set_storage_fn)?;
