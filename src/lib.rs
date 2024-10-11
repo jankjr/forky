@@ -223,8 +223,6 @@ fn runtime<'a, C: Context<'a>>(cx: &mut C) -> NeonResult<&'static Runtime> {
         
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .worker_threads(4)
-            .global_queue_interval(8)
             .build()
             .or_else(|err| cx.throw_error(err.to_string()))
     })
@@ -438,10 +436,10 @@ fn instantiate_run_tx<'a>(
                     .map(|v: Address| {
                         (
                             v,
-                            (0u64..10u64)
-                                .map(|i| revm::primitives::U256::from(i))
-                                .chain(DEFAULT_SLOTS.iter().map(|v| v.clone()).collect::<Vec<revm::primitives::U256>>())
-                                .collect::<Vec<revm::primitives::U256>>()
+                            vec![
+                                revm::primitives::U256::from(0),
+                                revm::primitives::U256::from(5)
+                            ]
                         )
                     })
                     .collect();
@@ -961,10 +959,10 @@ fn create_preload_fn<'a>(
                 let positions = addreses.into_iter().map(|v| {
                     (
                         v,
-                        (0u64..10u64)
-                                .map(|i| revm::primitives::U256::from(i))
-                                .chain(DEFAULT_SLOTS.iter().map(|v| v.clone()).collect::<Vec<revm::primitives::U256>>())
-                                .collect::<Vec<revm::primitives::U256>>()
+                        vec![
+                            revm::primitives::U256::from(0),
+                            revm::primitives::U256::from(5)
+                        ]
                     )
                 }).collect::<Vec<_>>();
 
@@ -1255,7 +1253,7 @@ fn create_simulator(mut cx: FunctionContext) -> JsResult<JsPromise> {
 #[neon::main]
 pub fn main(mut cx: ModuleContext) -> NeonResult<()> {
     if std::env::var_os("RUST_LOG").is_none() {
-        std::env::set_var("RUST_LOG", LOGGER_TARGET_MAIN);
+        std::env::set_var("RUST_LOG", "slot0=info");
     }
     log::set_max_level(log::LevelFilter::Debug);
     pretty_env_logger::init();

@@ -23,12 +23,31 @@ use futures::future::try_join_all;
 
 use dashmap::{try_result::TryResult, DashMap, Entry};
 use eyre::{Context, ContextCompat};
-use revm::primitives::{alloy_primitives::aliases as prims, Address, KECCAK_EMPTY};
+use revm::primitives::{alloy_primitives::aliases as prims, Address, KECCAK_EMPTY, U256};
 use revm::{db::DatabaseRef, primitives::AccountInfo, Database};
-use std::{collections::BTreeMap, sync::Arc};
+use rustc_hash::FxBuildHasher;
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 use tokio::{runtime::Handle, sync::RwLock};
 
 use crate::{config::LinkType, LOGGER_TARGET_SYNC};
+
+async fn load_storage_slot_inner(
+    provider: alloy::providers::RootProvider<BoxTransport>,
+    address: Address,
+    index: prims::U256,
+    block_num: u64,
+) -> eyre::Result<prims::U256> {
+    log::trace!(target: LOGGER_TARGET_SYNC, "Fetching storage {} {}", &address, &index);
+    let value = provider
+        .get_storage_at(address, index)
+        .block_id(BlockId::from(block_num))
+        .await?;
+
+    Ok(value)
+}
 
 #[derive(Debug, Clone)]
 pub struct Forked {
@@ -89,6 +108,7 @@ impl Forked {
 impl DatabaseRef for Forked {
     type Error = eyre::Error;
 
+    #[inline]
     fn basic_ref(
         &self,
         address: revm::primitives::Address,
@@ -96,6 +116,7 @@ impl DatabaseRef for Forked {
         Forked::block_on(async { self.cannonical.clone().basic(address).await })
     }
 
+    #[inline]
     fn code_by_hash_ref(
         &self,
         code_hash: prims::B256,
@@ -103,14 +124,16 @@ impl DatabaseRef for Forked {
         Forked::block_on(async { self.cannonical.clone().code_by_hash(code_hash).await })
     }
 
+    #[inline]
     fn storage_ref(
         &self,
         address: revm::primitives::Address,
         index: prims::U256,
     ) -> Result<prims::U256, Self::Error> {
-        Forked::block_on(async { self.cannonical.clone().storage(address, index).await })
+        Forked::block_on(async { self.cannonical.clone().storage(&address, &index).await })
     }
 
+    #[inline]
     fn block_hash_ref(&self, number: u64) -> Result<prims::B256, Self::Error> {
         Forked::block_on(async { self.cannonical.clone().block_hash(number).await })
     }
@@ -147,18 +170,25 @@ impl Database for Forked {
     }
 }
 
+type StorageBlock = (
+    prims::U256,
+    prims::U256,
+    prims::U256,
+    prims::U256,
+    prims::U256,
+);
 #[derive(Debug, Clone)]
 pub struct CannonicalFork {
     // Results fetched from the provider and maintained by apply_next_mainnet_block,
     // Contains the full state of the account & storage
     link_type: LinkType,
 
-    contracts: DashMap<prims::B256, revm::primitives::Bytecode>,
-    block_hashes: DashMap<u64, prims::B256>,
-    storage: DashMap<Address, DashMap<prims::U256, prims::U256>>,
-    accounts: DashMap<Address, AccountInfo>,
-    pending_storage_reads: DashMap<(Address, prims::U256), prims::U256>,
-    pending_basic_reads: DashMap<Address, revm::primitives::AccountInfo>,
+    contracts: DashMap<prims::B256, revm::primitives::Bytecode, FxBuildHasher>,
+    block_hashes: DashMap<u64, prims::B256, FxBuildHasher>,
+    storage: DashMap<Address, DashMap<prims::U256, prims::U256, FxBuildHasher>, FxBuildHasher>,
+    accounts: DashMap<Address, AccountInfo, FxBuildHasher>,
+    pending_storage_reads: DashMap<(Address, prims::U256), StorageBlock, FxBuildHasher>,
+    pending_basic_reads: DashMap<Address, revm::primitives::AccountInfo, FxBuildHasher>,
 
     current_block: Arc<RwLock<Block>>,
     provider: alloy::providers::RootProvider<BoxTransport>,
@@ -174,12 +204,18 @@ impl CannonicalFork {
     ) -> Self {
         Self {
             link_type: config.link_type,
-            accounts: DashMap::with_capacity(1024 * 8),
-            storage: DashMap::with_capacity(1024 * 64),
-            pending_basic_reads: DashMap::with_capacity(1024 * 8),
-            pending_storage_reads: DashMap::with_capacity(1024 * 64),
-            contracts: DashMap::with_capacity(1024 * 8),
-            block_hashes: DashMap::with_capacity(1024 * 8),
+            accounts: DashMap::with_capacity_and_hasher(1024 * 256, FxBuildHasher::default()),
+            storage: DashMap::with_capacity_and_hasher(1024 * 256, FxBuildHasher::default()),
+            pending_basic_reads: DashMap::with_capacity_and_hasher(
+                1024 * 256,
+                FxBuildHasher::default(),
+            ),
+            pending_storage_reads: DashMap::with_capacity_and_hasher(
+                1024 * 256,
+                FxBuildHasher::default(),
+            ),
+            contracts: DashMap::with_capacity_and_hasher(1024 * 8, FxBuildHasher::default()),
+            block_hashes: DashMap::with_capacity_and_hasher(1024 * 8, FxBuildHasher::default()),
             current_block: Arc::new(RwLock::new(fork_block)),
             provider,
             provider_trace,
@@ -260,22 +296,24 @@ impl CannonicalFork {
                     continue;
                 }
 
-                for (hpos, value) in v.storage {
-                    let pos: revm::primitives::U256 = hpos.into();
-                    let value_to_insert: revm::primitives::U256 = value.into();
-                    match self.storage.try_get(&addr) {
-                        TryResult::Present(acc) => match acc.entry(pos) {
-                            Entry::Occupied(acs) => {
-                                acs.replace_entry(value_to_insert);
-                            }
-                            _ => {}
-                        },
-                        _ => {}
-                    }
+                for (index, update) in v.storage {
+                    self.update_storage_value(addr, index.into(), update.into());
                 }
             }
         }
         Ok(())
+    }
+
+    fn update_storage_value(&self, address: Address, index: prims::U256, value: prims::U256) {
+        match self.storage.try_get_mut(&address) {
+            TryResult::Present(table) => match table.entry(index) {
+                Entry::Occupied(mut a) => {
+                    a.insert(value);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
     }
     pub async fn get_current_block(&self) -> eyre::Result<u64> {
         Ok(self.current_block.read().await.header.number)
@@ -392,29 +430,17 @@ impl CannonicalFork {
                     }
                 };
 
-                if v.storage.is_empty() && !self.storage.contains_key(&addr) {
+                if v.storage.is_empty() || self.storage.try_get(&addr).is_absent() {
                     continue;
                 }
-                match self.storage.entry(addr) {
-                    Entry::Occupied(a) => {
-                        for (pos, pos_val) in v.storage {
-                            let value_to_insert = match pos_val {
-                                Delta::Added(value) => value,
-                                Delta::Changed(t) => t.to,
-                                _ => continue,
-                            };
-                            let table = a.get();
-                            match table.entry(pos.into()) {
-                                Entry::Occupied(a) => {
-                                    a.replace_entry(value_to_insert.into());
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    _ => {
-                        continue;
-                    }
+
+                for (index, change) in v.storage {
+                    let update = match change {
+                        Delta::Added(value) => value,
+                        Delta::Changed(t) => t.to,
+                        _ => continue,
+                    };
+                    self.update_storage_value(addr, index.into(), update.into());
                 }
             }
         }
@@ -423,18 +449,46 @@ impl CannonicalFork {
     async fn load_storage_slot(
         &self,
         address: Address,
-        index: prims::U256,
+        index: U256,
         block_num: u64,
-    ) -> eyre::Result<(Address, prims::U256, prims::U256)> {
-        log::trace!(target: LOGGER_TARGET_SYNC, "Fetching storage {} {}", &address, &index);
-        let value = self
-            .provider
-            .get_storage_at(address, index)
-            .block_id(BlockId::from(block_num))
-            .await
-            .wrap_err_with(|| "Failed to fetch storage slot")?;
-        Ok((address, index, value))
+    ) -> eyre::Result<(Address, U256, StorageBlock)> {
+        let provider = self.provider.clone();
+        let out = tokio::spawn(async move {
+            let joined: Result<(U256, U256, U256, U256, U256), eyre::Error> = tokio::try_join!(
+                load_storage_slot_inner(provider.clone(), address, index.clone(), block_num),
+                load_storage_slot_inner(
+                    provider.clone(),
+                    address,
+                    index + U256::from(1),
+                    block_num
+                ),
+                load_storage_slot_inner(
+                    provider.clone(),
+                    address,
+                    index + U256::from(2),
+                    block_num
+                ),
+                load_storage_slot_inner(
+                    provider.clone(),
+                    address,
+                    index + U256::from(3),
+                    block_num
+                ),
+                load_storage_slot_inner(
+                    provider.clone(),
+                    address,
+                    index + U256::from(4),
+                    block_num
+                )
+            );
+            joined
+        })
+        .await?;
+
+        let out = out?;
+        Ok((address, index.clone(), out))
     }
+
     async fn load_acc_info(
         &self,
         address: Address,
@@ -517,33 +571,27 @@ impl CannonicalFork {
             .flat_map(|((addr, positions), _)| {
                 positions
                     .iter()
+                    .map(|index| index / U256::from(5))
                     .filter(|pos| match self.storage.try_get(addr) {
                         TryResult::Present(acc) => !acc.contains_key(&pos),
                         _ => true,
                     })
-                    .map(move |pos| (addr, pos))
+                    .map(|pos| (addr, pos))
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .map(|(a, s)| (*a, s, s * U256::from(5)))
                     .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+            });
 
-        let storage_slots = try_join_all(
+        let res = try_join_all(
             addr_slot_pairs
-                .into_iter()
-                .map(|(addr, pos)| self.load_storage_slot(*addr, *pos, block_number)),
+                .map(|(address, _, index)| self.load_storage_slot(address, index, block_number))
+                .collect::<Vec<_>>(),
         )
-        .await
-        .wrap_err("Failed to fetch storage slots for all addresses")?;
+        .await?;
 
-        for (addr, pos, value) in storage_slots {
-            match self.storage.entry(addr) {
-                Entry::Occupied(mut a) => {
-                    a.get_mut().insert(pos, value);
-                }
-                Entry::Vacant(accs) => {
-                    let table = accs.insert(DashMap::new());
-                    table.insert(pos, value);
-                }
-            }
+        for res in res.iter() {
+            self.insert_block_to_storage(&res.0, &res.1, &res.2);
         }
 
         Ok(())
@@ -580,15 +628,6 @@ impl CannonicalFork {
         if let TryResult::Present(acc) = self.accounts.try_get(&address) {
             return Ok(Some(acc.clone()));
         }
-        {
-            self.load_positions(vec![(
-                address.clone(),
-                (0u64..10u64)
-                    .map(|i| revm::primitives::U256::from(i))
-                    .collect::<Vec<revm::primitives::U256>>(),
-            )])
-            .await?;
-        }
         Ok(Some(self.fetch_basic_from_remote(address).await?))
     }
     async fn code_by_hash(
@@ -600,47 +639,89 @@ impl CannonicalFork {
             None => Ok(revm::primitives::Bytecode::new()),
         }
     }
-    async fn fetch_storage(
+    async fn try_fetch_storage(
         &self,
-        address: Address,
-        index: revm::primitives::ruint::Uint<256, 4>,
-    ) -> eyre::Result<prims::U256> {
-        let block_number = self.get_current_block().await?;
-        match self.pending_storage_reads.entry((address, index)) {
-            Entry::Vacant(accs) => {
-                let data = {
+        address: &Address,
+        table_index: &U256,
+        block_number: u64,
+    ) -> eyre::Result<StorageBlock> {
+        let table_aligned = table_index * revm::primitives::U256::from(5);
+        let key = (address.clone(), *table_index);
+        let data: eyre::Result<(U256, U256, U256, U256, U256)> =
+            match self.pending_storage_reads.entry(key) {
+                Entry::Vacant(entry) => {
                     let data = self
-                        .load_storage_slot(address, index, block_number)
+                        .load_storage_slot(key.0, table_aligned, block_number)
                         .await?
                         .2;
-                    accs.insert(data);
-                    data.clone()
-                };
-                match self.storage.entry(address) {
-                    Entry::Occupied(mut a) => {
-                        a.get_mut().insert(index, data);
-                    }
-                    Entry::Vacant(acc_storage) => {
-                        let table = acc_storage.insert(DashMap::new());
-                        table.insert(index, data);
-                    }
+                    entry.insert(data);
+                    Ok(data.clone())
                 }
-                return Ok(data);
-            }
-            Entry::Occupied(account_table) => {
-                return Ok(account_table.get().clone());
-            }
+                Entry::Occupied(acc) => Ok(acc.get().clone()),
+            };
+
+        let data = data?;
+        return Ok(data);
+    }
+
+    fn insert_block_to_storage(
+        &self,
+        address: &Address,
+        aligned_index: &prims::U256,
+        block: &StorageBlock,
+    ) {
+        let storage = self.storage.entry(*address).or_default();
+        storage.insert(aligned_index + U256::from(1), block.1);
+        storage.insert(aligned_index + U256::from(2), block.2);
+        storage.insert(aligned_index + U256::from(3), block.3);
+        storage.insert(aligned_index + U256::from(4), block.4);
+        storage.insert(*aligned_index, block.0);
+    }
+    async fn fetch_storage(&self, address: &Address, index: &U256) -> eyre::Result<prims::U256> {
+        let block_number = self.get_current_block().await?;
+
+        let (table_index, rem) = index.div_rem(U256::from(5));
+        let data = self
+            .try_fetch_storage(address, &table_index, block_number)
+            .await?;
+
+        // if !data.1.is_zero() || !data.2.is_zero() || !data.3.is_zero() || !data.4.is_zero() {
+        //     let s = self.clone();
+        //     let address = address.clone();
+        //     let table_index = table_index + U256::from(1);
+        //     if self
+        //         .pending_storage_reads
+        //         .try_get(&(address, table_index))
+        //         .is_absent()
+        //     {
+        //         tokio::spawn(async move {
+        //             let mut table_index = table_index;
+        //             let data = s
+        //                 .try_fetch_storage(&address, &table_index, block_number)
+        //                 .await;
+        //             if let Ok(data) = data {
+        //                 s.insert_block_to_storage(&address, &table_index, &data);
+        //             }
+        //         });
+        //     }
+        // }
+
+        let aligned_index = &table_index * U256::from(5);
+        self.insert_block_to_storage(address, &aligned_index, &data);
+        match rem.to() {
+            0 => Ok(data.0),
+            1 => Ok(data.1),
+            2 => Ok(data.2),
+            3 => Ok(data.3),
+            4 => Ok(data.4),
+            _ => Err(eyre::eyre!("Invalid storage index {}", rem)),
         }
     }
 
-    pub async fn storage(
-        &self,
-        address: Address,
-        index: revm::primitives::ruint::Uint<256, 4>,
-    ) -> eyre::Result<prims::U256> {
-        if let TryResult::Present(acc) = self.storage.try_get(&address) {
-            if let TryResult::Present(acc) = acc.try_get(&index) {
-                return Ok(acc.clone());
+    pub async fn storage(&self, address: &Address, index: &U256) -> eyre::Result<prims::U256> {
+        if let TryResult::Present(acc) = self.storage.try_get(address) {
+            if let TryResult::Present(acc) = acc.try_get(index) {
+                return Ok(acc.clone().into());
             }
         };
         return Ok(self.fetch_storage(address, index).await?);
