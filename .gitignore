@@ -4,4 +4,4 @@ target
 npm-debug.log*cargo.log
 cross.log
 index.node
-
+cargo.log
