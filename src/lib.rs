@@ -3,7 +3,8 @@ use alloy::hex::FromHex;
 use alloy::transports::BoxTransport;
 
 use alloy_provider::Provider;
-use dashmap::DashSet;
+use futures::FutureExt;
+use scc::hash_set::HashSet;
 use eyre::ContextCompat;
 use eyre::Ok;
 use neon::handle::Handle;
@@ -23,11 +24,9 @@ use revm::DatabaseRef;
 use revm::{primitives::Address, Evm};
 
 use once_cell::sync::OnceCell;
-use tokio::sync::RwLock;
 
 use std::borrow::BorrowMut;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::ops::DerefMut;
 use std::{str::FromStr, sync::Arc};
 use tokio::runtime::Runtime;
@@ -53,9 +52,8 @@ pub struct TransactionRequest {
     pub value: revm::primitives::U256
 }
 pub struct ApplicationState {
-    pub desynchronized: Arc<RwLock<bool>>,
     pub cannonical: Arc<CannonicalFork>,
-    pub preload: Arc<DashSet<Address>>,
+    pub preload: Arc<HashSet<Address>>,
     pub provider: alloy::providers::RootProvider<BoxTransport>,
     pub provider_trace: alloy::providers::RootProvider<BoxTransport>,
     pub config: Config,
@@ -105,14 +103,13 @@ impl ApplicationState {
             .wrap_err("Network contains no blocks")?;
 
         let out = Self {
-            desynchronized: Arc::new(RwLock::new(false)),
             cannonical: Arc::new(CannonicalFork::new(
                 provider.clone(),
                 provider_trace.clone(),
                 fork_block,
                 config.clone(),
             )),
-            preload: Arc::new(DashSet::new()),
+            preload: Arc::new(HashSet::new()),
             provider: provider.clone(),
             provider_trace: provider_trace.clone(),
             config,
@@ -122,9 +119,6 @@ impl ApplicationState {
     }
 
     async fn fork_db<'a>(&self) -> eyre::Result<ActiveForkRef> {
-        if self.desynchronized.read().await.eq(&true) {
-            return Err(eyre::eyre!("Simulator desynchronized, please create new simulator"));
-        }
         // Forks the current state of the cannonical fork into into a new EVM instance with
         // it's own CacheDB that does the following:
         // All read that are not found in the fork, get loaded from the cannonical fork, which will either pull
@@ -151,10 +145,6 @@ impl ApplicationState {
         &self,
         latest_block: u64,
     ) -> eyre::Result<()> {
-        if self.desynchronized.read().await.eq(&true) {
-            return Err(eyre::eyre!("Simulator desynchronized, please create new simulator"));
-        }
-        
         let mut current_syncced_block = self.cannonical
             .get_current_block()
             .await?;
@@ -314,7 +304,7 @@ fn js_obj_tx_to_transaction<'a>(
 }
 
 struct LogTracer {
-    pub memory_reads: HashMap<revm::primitives::Address, HashSet<revm::primitives::U256>>,
+    pub memory_reads: HashMap<revm::primitives::Address, std::collections::HashSet<revm::primitives::U256>>,
     pub logs: Vec<(
         revm::primitives::Address,
         Vec<revm::primitives::FixedBytes<32>>,
@@ -364,7 +354,7 @@ impl revm::Inspector<&mut CacheDB<Forked>> for LogTracer {
                 .and_modify(|set| {
                     set.insert(loc);
                 })
-                .or_insert(HashSet::from_iter(vec![loc]));
+                .or_insert(std::collections::HashSet::from_iter(vec![loc]));
             return;
         }
     }
@@ -426,23 +416,13 @@ fn instantiate_run_tx<'a>(
         rt.spawn(async move {
             let app_state = app_state.clone();
             let out = {
-                let out: Vec<Address> = app_state.preload.iter().map(|v| v.clone()).collect();
+                let mut out: Vec<Address> = Vec::new();
+                app_state.preload.scan_async(|v|out.push(v.clone())).await;
                 app_state.preload.clear();
                 out
             };
             if out.len() != 0 {
-                let out: Vec<(Address, Vec<revm::primitives::U256>)> = out
-                    .into_iter()
-                    .map(|v: Address| {
-                        (
-                            v,
-                            vec![
-                                revm::primitives::U256::from(0),
-                                revm::primitives::U256::from(5)
-                            ]
-                        )
-                    })
-                    .collect();
+                
                 log::info!(target: LOGGER_TARGET_MAIN, "Preloading {} addresses", out.len());
 
                 let state = app_state.cannonical.clone();
@@ -956,18 +936,8 @@ fn create_preload_fn<'a>(
                     JsResult::Ok(cx.undefined())
                 });
             } else if addreses.len() > 1 {
-                let positions = addreses.into_iter().map(|v| {
-                    (
-                        v,
-                        vec![
-                            revm::primitives::U256::from(0),
-                            revm::primitives::U256::from(5)
-                        ]
-                    )
-                }).collect::<Vec<_>>();
-
                 match db.cannonical.load_positions(
-                    positions
+                    addreses
                 ).await {
                     eyre::Result::Err(e) => {
                         log::error!(target: LOGGER_TARGET_MAIN, "Failed to preload {}", e)
@@ -1159,9 +1129,6 @@ fn create_on_block_fn<'a>(
 
             match state.on_block(block_number).await {
                 Err(e) => {
-                    {
-                        *state.desynchronized.write().await = true;
-                    }
                     deferred.settle_with(&channel, move |mut cx| {
                         let err = cx.error(e.to_string())?;
                         cx.throw::<_, Handle<'_, JsUndefined>>(err)
