@@ -14,8 +14,6 @@ use alloy::{
         },
         Block,
     },
-    signers::k256::elliptic_curve::rand_core::block,
-    sol_types::sol_data::FixedBytes,
     transports::BoxTransport,
 };
 use alloy_provider::{
@@ -23,13 +21,11 @@ use alloy_provider::{
     Provider,
 };
 use eyre::{Context, ContextCompat};
-use futures::future::{join_all, try_join_all};
-use itertools::Itertools;
+use futures::{future::try_join_all, try_join, FutureExt};
 use revm::primitives::{Address, B256, KECCAK_EMPTY, U256};
 use revm::{db::DatabaseRef, primitives::AccountInfo, Database};
-use rustc_hash::FxBuildHasher;
 use scc::hash_map::Entry;
-use std::{collections::BTreeMap, future::IntoFuture, sync::Arc};
+use std::{collections::BTreeMap, future::{Future, IntoFuture}, sync::Arc};
 use tokio::{runtime::Handle, sync::RwLock};
 
 type Hasher = hash_hasher::HashBuildHasher;
@@ -471,10 +467,11 @@ impl CannonicalFork {
         let provider = self.provider.clone();
         let values = try_join_all((0..slots).map(|offset| {
             provider
-                    .get_storage_at(address, index + U256::from(offset))
-                    .block_id(BlockId::from(block_num))
-                    .into_future()
-        })).await;
+                .get_storage_at(address, index + U256::from(offset))
+                .block_id(BlockId::from(block_num))
+                .into_future()
+        }))
+        .await;
         values
         // let values = try_join_all((0..slots).map(|offset| {
         //     let provider = provider.clone();
@@ -506,18 +503,18 @@ impl CannonicalFork {
     ) -> eyre::Result<(Address, AccountInfo, Vec<U256>)> {
         let provider = self.provider.clone();
         let s = self.clone();
-        let account_state = tokio::spawn(async move {
-            let s = s.clone();
-            let block_id = BlockId::from(block_num);
-            log::trace!(target: LOGGER_TARGET_SYNC, "Fetching account {}", address);
-            let out = tokio::try_join!(
-                provider.get_balance(address).block_id(block_id),
-                provider.get_code_at(address).block_id(block_id),
-                s.load_storage_slots(address, U256::from(0), block_num, 20)
-            );
-            out
-        })
-        .await??;
+        let block_id = BlockId::from(block_num);
+        let account_state = try_join!(
+            provider
+                .get_balance(address)
+                .block_id(block_id)
+                .into_future(),
+            provider
+                .get_code_at(address)
+                .block_id(block_id)
+                .into_future(),
+            s.load_storage_slots(address, U256::from(0), block_num, 25)
+        )?;
 
         let (balance, code, slots) = account_state;
         let (code, code_hash) = match code.is_empty() {
@@ -694,13 +691,19 @@ impl CannonicalFork {
                     ),
                 );
 
-                for offset in 0..data.len() {
-                    let index = index + U256::from(offset);
-                    let value = data[offset];
-                    if let Err(_) = table.insert_async(index, value).await {
-                        log::error!(target: LOGGER_TARGET_SYNC, "Failed to insert storage value");
-                    }
+                let index = index;
+                let value = data[0];
+                if let Err(_) = table.insert_async(index, value).await {
+                    log::error!(target: LOGGER_TARGET_SYNC, "Failed to insert storage value");
                 }
+
+                // for offset in 0..data.len() {
+                //     let index = index + U256::from(offset);
+                //     let value = data[offset];
+                //     if let Err(_) = table.insert_async(index, value).await {
+                //         log::error!(target: LOGGER_TARGET_SYNC, "Failed to insert storage value");
+                //     }
+                // }
                 return Ok(data[0]);
             }
             scc::hash_index::Entry::Occupied(previous) => {
