@@ -3,13 +3,13 @@ use alloy::hex::FromHex;
 use alloy::transports::BoxTransport;
 
 use alloy_provider::Provider;
-use futures::FutureExt;
+use neon::prelude::Context;
 use scc::hash_set::HashSet;
 use eyre::ContextCompat;
 use eyre::Ok;
 use neon::handle::Handle;
 use neon::object::Object;
-use neon::prelude::{Context, FunctionContext, ModuleContext, TaskContext};
+use neon::prelude::{FunctionContext, ModuleContext, TaskContext};
 use neon::result::{self, JsResult, NeonResult};
 use neon::types::JsArray;
 use neon::types::JsUndefined;
@@ -24,18 +24,21 @@ use revm::DatabaseRef;
 use revm::{primitives::Address, Evm};
 
 use once_cell::sync::OnceCell;
+use utils::provider_from_string;
 
 use std::borrow::BorrowMut;
 use std::collections::HashMap;
 use std::ops::DerefMut;
+use std::thread::ThreadId;
 use std::{str::FromStr, sync::Arc};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 
+pub mod utils;
 pub mod cannonical;
+pub mod analysis;
 pub mod config;
 use cannonical::{CannonicalFork, Forked};
-
 use config::{Config, LinkType};
 // pub mod errors;
 
@@ -134,11 +137,53 @@ impl ApplicationState {
             db: revm::db::CacheDB::<Forked>::new(Forked {
                 cannonical: reader,
                 env: block_env,
-                seconds_per_block: U256::from(self.config.seconds_per_block),
+                seconds_per_block: U256::from(self.config.seconds_per_block)
+                // dry_run: false,
             }),
             checkpoints: HashMap::new(),
         }));
         Ok(out)
+    }
+
+    pub async fn load_positions(
+        &self,
+        addresses: Vec<Address>,
+    ) -> eyre::Result<()> {
+        log::info!(target: LOGGER_TARGET_MAIN, "Preloading {} addresses", addresses.len());
+        let run = addresses;
+        let next = match self.cannonical.load_positions(
+            run
+        ).await {
+            eyre::Result::Ok(v) => v,
+            Err(e) => {
+                log::error!(target: LOGGER_TARGET_MAIN, "Failed to preload {}", e);
+                return Err(e);
+            }
+        };
+        if next.len() > 10 {
+            let mut run = next;
+            let s = self.cannonical.clone();
+            tokio::spawn(async move {
+                loop {
+                    log::info!(target: LOGGER_TARGET_MAIN, "Loading {} more addresses", run.len());
+                    let next = match s.load_positions(
+                        run
+                    ).await {
+                        eyre::Result::Ok(v) => v,
+                        Err(e) => {
+                            log::error!(target: LOGGER_TARGET_MAIN, "Failed to preload {}", e);
+                            return Err(e);
+                        }
+                    };
+                    if next.len() < 10 {
+                        return Ok(())
+                    }
+                    run = next;
+                }
+            });
+        }
+        Ok(())
+        
     }
 
     pub async fn on_block(
@@ -210,26 +255,13 @@ fn runtime<'a, C: Context<'a>>(cx: &mut C) -> NeonResult<&'static Runtime> {
     static RUNTIME: OnceCell<Runtime> = OnceCell::new();
 
     RUNTIME.get_or_try_init(|| {
-        
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
+            .event_interval(8)
+            .max_io_events_per_tick(4096)
             .build()
             .or_else(|err| cx.throw_error(err.to_string()))
     })
-}
-
-
-async fn provider_from_string(url: &String) -> eyre::Result<alloy::providers::RootProvider<BoxTransport>> {
-    let builder = alloy::providers::ProviderBuilder::new();
-    let out = if url.starts_with("http") {
-        builder.on_http(url.as_str().parse()?).boxed()
-    } else if url.starts_with("ws") {
-        builder.on_ws(alloy::providers::WsConnect::new(url.as_str())).await?.boxed()
-    } else {
-        return Err(eyre::eyre!("Invalid provider type"))
-    };
-    
-    Ok(out)
 }
 
 async fn init_application_state(config: Config) -> eyre::Result<ApplicationStateRef> {
@@ -313,6 +345,10 @@ struct LogTracer {
 }
 
 impl LogTracer {
+    pub fn reset(&mut self) {
+        self.logs.clear();
+        self.memory_reads.clear();
+    }
     pub fn new() -> Self {
         Self {
             logs: Vec::new(),
@@ -409,8 +445,6 @@ fn instantiate_run_tx<'a>(
         let js_obj_tx: Handle<'_, JsObject> = fnctx.argument::<JsObject>(0)?;
         let tx = js_obj_tx_to_transaction(fnctx, js_obj_tx)?;
 
-        log::trace!(target: LOGGER_TARGET_MAIN, "executing transaction: {:?}", tx);
-
         let app_state = app_state.clone();
         let db = db.clone();
         rt.spawn(async move {
@@ -422,11 +456,7 @@ fn instantiate_run_tx<'a>(
                 out
             };
             if out.len() != 0 {
-                
-                log::info!(target: LOGGER_TARGET_MAIN, "Preloading {} addresses", out.len());
-
-                let state = app_state.cannonical.clone();
-                match state
+                match app_state
                     .load_positions(out)
                     .await
                 {
@@ -447,10 +477,11 @@ fn instantiate_run_tx<'a>(
             };
 
             let result = {
+                let start_time = std::time::Instant::now();
 
                 let tracer = LogTracer::new();
+
                 let env = active_fork.db.db.env.clone();
-                log::debug!(target: LOGGER_TARGET_MAIN, "Simulator env {:?}", env);
                 let gas_limit = env.gas_limit;
                 let inner_db =  active_fork.db.borrow_mut();
                 let out: Evm<'_, LogTracer, &mut CacheDB<Forked>> = revm::Evm::builder()
@@ -464,9 +495,6 @@ fn instantiate_run_tx<'a>(
                     .append_handler_register(revm::inspector_handle_register)
                     .with_spec_id(revm::primitives::SpecId::CANCUN)
                     .build();
-
-
-                let start_time = std::time::Instant::now();
                 let mut simulation_runner = out
                     .modify()
                     .modify_tx_env(|env| {
@@ -481,8 +509,7 @@ fn instantiate_run_tx<'a>(
                         env.transact_to = TransactTo::Call(tx.to);
                     })
                     .build();
-
-                    
+                
                 let result = simulation_runner.transact_commit();
 
                 let end_time = std::time::Instant::now();
@@ -907,6 +934,7 @@ fn init_preload_addr_fn<'a>(
     })
 }
 
+
 fn create_preload_fn<'a>(
     app_state: ApplicationStateRef,
     cx: &mut TaskContext<'a>,
@@ -931,21 +959,26 @@ fn create_preload_fn<'a>(
             let db = db.clone();
             
             if addreses.len() == 1 {
-                db.preload.insert(addreses[0]);
+                if let Err(_) = db.preload.insert_async(addreses[0]).await {}
+                
                 deferred.settle_with(&channel, |mut cx|{
                     JsResult::Ok(cx.undefined())
                 });
             } else if addreses.len() > 1 {
-                match db.cannonical.load_positions(
+                let res = db.load_positions(
                     addreses
-                ).await {
-                    eyre::Result::Err(e) => {
-                        log::error!(target: LOGGER_TARGET_MAIN, "Failed to preload {}", e)
-                    }
-                    _ => {}
-                }
+                ).await;
                 deferred.settle_with(&channel, |mut cx|{
-                    JsResult::Ok(cx.undefined())
+                    match res {
+                        eyre::Result::Ok(_) => {
+                            JsResult::Ok(cx.undefined())
+                        }
+                        eyre::Result::Err(e) => {
+                            log::error!(target: LOGGER_TARGET_MAIN, "Failed to preload {}", e);
+                            let err = cx.error(e.to_string())?;
+                            cx.throw::<_, Handle<'_, JsUndefined>>(err)
+                        }
+                    }
                 });
             }
         });
