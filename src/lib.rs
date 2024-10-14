@@ -66,14 +66,17 @@ fn bigint_to_u256<'a>(
     value: Handle<'a, JsBigInt>,
     cx: &mut FunctionContext<'a>,
 ) -> neon::result::NeonResult<revm::primitives::U256> {
-    let mut limbs: [u64; 4] = [0; 4];
+    let decimal = value.to_string(cx)?.value(cx);
+    let o = match U256::from_str_radix(&decimal, 10) {
+        std::result::Result::Ok(v) => v,
+        Err(e) => {
+            return cx.throw_error(e.to_string());
+        }
+    };
 
-    let value = value.read_digits_le(cx, &mut limbs);
+    log::debug!(target: LOGGER_TARGET_MAIN, "Converting bigint {} =>  {} U256", decimal, o); 
 
-    let o = revm::primitives::U256::from_limbs_slice(&limbs);
-    if value.0 == JsBigInt::NEGATIVE {
-        return cx.throw_error("Cannot convert negative bigint to U256");
-    }
+
     std::result::Result::Ok(o)
 }
 
@@ -1006,8 +1009,9 @@ fn instantiate_set_storage_fn<'a>(
         let (deferred, promise) = cx.promise();
         runtime(&mut cx)?.spawn(async move {
             let mut forked = db.clone().lock_owned().await;
-
+            if let Err(_) = forked.db.db.cannonical.get_account_data(&address).await {}
             let acc = forked.db.insert_account_storage(address, key, new_value);
+
             deferred.settle_with(&channel, move |mut cx: TaskContext| {
                 to_neon(&mut cx, acc)?;
                 NeonResult::Ok(cx.undefined())
@@ -1252,9 +1256,9 @@ fn create_simulator(mut cx: FunctionContext) -> JsResult<JsPromise> {
 
 #[neon::main]
 pub fn main(mut cx: ModuleContext) -> NeonResult<()> {
-    if std::env::var_os("RUST_LOG").is_none() {
-        std::env::set_var("RUST_LOG", "slot0=info");
-    }
+    // if std::env::var_os("RUST_LOG").is_none() {
+    //     std::env::set_var("RUST_LOG", "slot0=info");
+    // }
     log::set_max_level(log::LevelFilter::Debug);
     pretty_env_logger::init();
 

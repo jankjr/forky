@@ -81,6 +81,7 @@ fn is_push(opcode: Opcode) -> bool {
 }
 
 pub fn perform_analysis(bytecode: &Bytecode) -> eyre::Result<(Vec<Address>, Vec<U256>)> {
+    
     let start = std::time::Instant::now();
     let bytes: Vec<u8> = bytecode.bytes().to_vec();
     let contract_instructions = disassemble_bytes(bytes.clone());
@@ -131,7 +132,8 @@ pub fn perform_analysis(bytecode: &Bytecode) -> eyre::Result<(Vec<Address>, Vec<
         }
     }
 
-    log::info!(target: LOGGER_TARGET_MAIN, "Disassembly took {:?}", start.elapsed());
+    log::debug!(target: LOGGER_TARGET_MAIN, "Disassembly took {:?}", start.elapsed());
+
     Ok((
         addresses.into_iter().unique().collect::<Vec<_>>(),
         slots.into_iter().unique().collect::<Vec<_>>(),
@@ -151,7 +153,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn it_works() {
         // let test_addr = Address::from(hex!("bf1c0206de440b2cf76ea4405e1dbf2fc227a463"));
-        let test_addr = Address::from(hex!("7effd7b47bfd17e52fb7559d3f924201b9dbff3d"));
+        // let test_addr = Address::from(hex!("7effd7b47bfd17e52fb7559d3f924201b9dbff3d"));
+        let test_addr = Address::from(hex!("BBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb"));
         let url = std::env::var_os("PROVIDER").unwrap();
         let provider = provider_from_string(&url.to_string_lossy().to_string())
             .await

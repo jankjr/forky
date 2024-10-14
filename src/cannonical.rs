@@ -127,24 +127,23 @@ impl DatabaseRef for Forked {
 
     #[inline]
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        let block_number: u64 = self.env.number.to();
-        Forked::block_on(async { self.cannonical.clone().basic(address, block_number).await })
+        log::trace!(target: LOGGER_TARGET_SYNC, "basic({})", address);
+        Forked::block_on(async { self.cannonical.clone().basic(address).await })
     }
 
     #[inline]
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<revm::primitives::Bytecode, Self::Error> {
+        log::trace!(target: LOGGER_TARGET_SYNC, "code_by_hash({})", code_hash);
         Forked::block_on(async { self.cannonical.clone().code_by_hash(code_hash).await })
     }
 
     #[inline]
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        let block_number: u64 = self.env.number.to();
-        Forked::block_on(async {
-            self.cannonical
-                .clone()
-                .storage(address, index, block_number)
-                .await
-        })
+        log::trace!(target: LOGGER_TARGET_SYNC, "call storage({}, {})", address, index);
+        let out = Forked::block_on(async { self.cannonical.clone().storage(address, index).await });
+        log::debug!(target: LOGGER_TARGET_SYNC, "return storage({}, {}) => {:?}", address, index, out);
+
+        out
     }
 
     #[inline]
@@ -577,7 +576,10 @@ impl CannonicalFork {
         slots_loaded: usize,
         proxy_slot_value: U256,
         incode: Bytecode,
+        contract_address: &Address,
     ) -> eyre::Result<(Option<Vec<Address>>, Option<Vec<U256>>)> {
+        log::debug!(target: LOGGER_TARGET_SYNC, "(Analysis) analyzing contract {}", contract_address);
+
         let data = if !proxy_slot_value.is_zero() {
             let implementation_addr: U160 = proxy_slot_value.to();
             let implementation_addr = Address::from(implementation_addr);
@@ -607,6 +609,9 @@ impl CannonicalFork {
 
         if additional_slots.len() == 0 {
             return Ok((contracts_referenced, None));
+        }
+        for index in additional_slots.iter() {
+            log::debug!(target: LOGGER_TARGET_SYNC, "(Analysis) slot: {}: {}", contract_address, index);
         }
         Ok((contracts_referenced, Some(additional_slots)))
     }
@@ -671,6 +676,7 @@ impl CannonicalFork {
                 SLOTS_TO_FETCH_ON_RUNNING,
                 proxy_slot_value,
                 code.clone(),
+                &address,
             )
             .await?;
 
@@ -870,7 +876,7 @@ impl CannonicalFork {
         };
         if let Some(code) = &code {
             let (refs, additional_slots) = self
-                .load_acc_info_analysis(block_num, slots, proxy_slot_value, code.clone())
+                .load_acc_info_analysis(block_num, slots, proxy_slot_value, code.clone(), &address)
                 .await?;
 
             if let Some(refs) = refs {
@@ -984,9 +990,7 @@ impl CannonicalFork {
     #[inline]
     async fn basic(
         &self,
-        address: Address,
-        block_number: u64,
-        // dry_run: bool,
+        address: Address, // dry_run: bool,
     ) -> eyre::Result<Option<AccountInfo>> {
         if let Some(value) = self.peek_account_info(&address).await {
             return Ok(Some(value));
@@ -998,9 +1002,13 @@ impl CannonicalFork {
         self.init_account_storage(&address);
 
         log::trace!(target: LOGGER_TARGET_SYNC, "(Cache miss) Fetching account {}", address);
+        let block_number: u64 = self.get_current_block().await?;
         let info = self.load_acc_info_live(address, block_number).await?;
         cell.set(info.clone());
         Ok(Some(info))
+    }
+    pub async fn get_account_data(&self, address: &Address) -> eyre::Result<Option<AccountInfo>> {
+        self.basic(address.clone()).await
     }
     #[inline]
     async fn peek_account_info(&self, address: &Address) -> Option<AccountInfo> {
@@ -1025,7 +1033,7 @@ impl CannonicalFork {
     async fn account_storage_value_initialized(&self, address: &Address, index: &U256) -> bool {
         if let Some(Some(_)) = self
             .storage
-            .peek_with(address, |_, v| v.peek_with(index, |_, v| true))
+            .peek_with(address, |_, v| v.peek_with(index, |_, __| true))
         {
             return true;
         }
@@ -1091,7 +1099,9 @@ impl CannonicalFork {
             .get_storage_at(address, index)
             .block_id(BlockId::from(block_number))
             .await
-            .wrap_err("Failed to fetch storage")?;
+            .wrap_err(format!(
+                "Failed to fetch storage for address {address} and index {index}"
+            ))?;
         cell.set(data.clone());
         Ok(data)
     }
@@ -1111,17 +1121,12 @@ impl CannonicalFork {
         Err(eyre::eyre!("Storage not found"))
     }
     #[inline]
-    async fn storage(
-        &self,
-        address: Address,
-        index: U256,
-        block_number: u64,
-        // dry_run: bool,
-    ) -> eyre::Result<U256> {
+    async fn storage(&self, address: Address, index: U256) -> eyre::Result<U256> {
         if let Ok(current_value) = self.peek_storage(&address, &index).await {
             return Ok(current_value);
         }
         log::trace!(target: LOGGER_TARGET_SYNC, "(miss) Fetching storage {} {}", address, index);
+        let block_number: u64 = self.get_current_block().await?;
         self.fetch_storage(address, index, block_number).await
     }
     async fn block_hash(&self, num: u64) -> eyre::Result<B256> {
