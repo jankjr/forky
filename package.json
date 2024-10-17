@@ -1,6 +1,6 @@
 {
   "name": "@slot0/forky",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "publishConfig": {
     "access": "public",
     "tag": "latest"

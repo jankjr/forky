@@ -46,7 +46,7 @@ use std::{
  *
  *    UINT < ADDRESS
  *    x < x[] < mapping(x => y) etc
- * 
+ *
  */
 use crate::LOGGER_TARGET_MAIN;
 
@@ -1257,14 +1257,12 @@ impl AbstractVMInstance {
                         Deref@AbstractValue::AddressRef(Deref@AbstractValue::UnaryOpResult(Opcode::SLOAD, _)) => {
                             analysis.external_contracts.push(top.clone());
                         }
-                        Deref@AbstractValue::BinOpResult(Opcode::AND, Deref@AbstractValue::Const(mask), Deref@AbstractValue::UnaryOpResult(Opcode::SLOAD, _)) => {
+                        Deref@AbstractValue::BinOpResult(Opcode::AND, Deref@AbstractValue::Const(_), Deref@AbstractValue::UnaryOpResult(Opcode::SLOAD, _)) => {
                             // for (i, size) in SIZE_MASKS.iter().enumerate() {
                             //     if mask.eq(size) {
                             //         break;
                             //     }
                             // }
-
-
                         }
 
                         _ => {}
@@ -2055,8 +2053,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn it_works() {
         // let test_addr = Address::from(hex!("bf1c0206de440b2cf76ea4405e1dbf2fc227a463"));
-        // let test_addr = Address::from(hex!("784955641292b0014bc9ef82321300f0b6c7e36d"));
-        let test_addr = Address::from(hex!("ac3E018457B222d93114458476f3E3416Abbe38F"));
+        let test_addr = Address::from(hex!("784955641292b0014bc9ef82321300f0b6c7e36d"));
+        // let test_addr = Address::from(hex!("ac3E018457B222d93114458476f3E3416Abbe38F"));
 
         // let test_addr = Address::from(hex!("7effd7b47bfd17e52fb7559d3f924201b9dbff3d"));
         // let test_addr = Address::from(hex!("BBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb"));
@@ -2071,7 +2069,8 @@ mod tests {
         match perform_analysis(&code, true) {
             Ok(data) => {
                 println!("Analyzed");
-                println!("Slots: {:?}", data);
+                println!("Slots: {}", data.0.iter().join("\n"));
+                println!("Addresses: {}", data.1.iter().join("\n"));
             }
             Err(e) => {
                 println!("Failed to analyze {}", e);
