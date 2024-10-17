@@ -1369,14 +1369,17 @@ dependencies = [
  "eyre",
  "futures",
  "hash_hasher",
+ "iset",
  "itertools 0.13.0",
  "log",
+ "match_deref",
  "neon",
  "once_cell",
  "pretty_env_logger",
  "revm",
  "rustc-hash",
  "scc",
+ "sdd",
  "serde",
  "serde_json",
  "tokio",
@@ -1772,6 +1775,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "187674a687eed5fe42285b40c6291f9a01517d415fad1c3cbc6a9f778af7fcd4"
 
 [[package]]
+name = "iset"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0a096b38f6994f43c7d21a2e9ef90eb188d2f9fbba13202a3c9d23f7b550738"
+
+[[package]]
 name = "itertools"
 version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1896,6 +1905,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37ee39891760e7d94734f6f63fedc29a2e4a152f836120753a72503f09fcf904"
 dependencies = [
  "hashbrown",
+]
+
+[[package]]
+name = "match_deref"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30dd27efba9ccf9069f76ff0b7b65eb293a844d9918e15a36098de609c9aacd7"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
 ]
 
 [[package]]

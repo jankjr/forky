@@ -29,7 +29,6 @@ use utils::provider_from_string;
 use std::borrow::BorrowMut;
 use std::collections::HashMap;
 use std::ops::DerefMut;
-use std::thread::ThreadId;
 use std::{str::FromStr, sync::Arc};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
@@ -49,10 +48,14 @@ pub const LOGGER_TARGET_SIMULATION: &str = "slot0::sim";
 
 #[derive(Debug, Clone)]
 pub struct TransactionRequest {
-    pub from: revm::primitives::Address,
-    pub to: revm::primitives::Address,
+    pub from: Address,
+    pub to: Address,
     pub data: Vec<u8>,
-    pub value: revm::primitives::U256
+    pub value: U256,
+    pub gas_price: Option<U256>,
+    pub gas_priority_fee: Option<U256>,
+    pub max_fee_per_gas: Option<U256>,
+    pub gas_limit: Option<U256>
 }
 pub struct ApplicationState {
     pub cannonical: Arc<CannonicalFork>,
@@ -73,8 +76,6 @@ fn bigint_to_u256<'a>(
             return cx.throw_error(e.to_string());
         }
     };
-
-    log::debug!(target: LOGGER_TARGET_MAIN, "Converting bigint {} =>  {} U256", decimal, o); 
 
 
     std::result::Result::Ok(o)
@@ -152,7 +153,6 @@ impl ApplicationState {
         &self,
         addresses: Vec<Address>,
     ) -> eyre::Result<()> {
-        log::info!(target: LOGGER_TARGET_MAIN, "Preloading {} addresses", addresses.len());
         let run = addresses;
         let next = match self.cannonical.load_positions(
             run
@@ -193,9 +193,7 @@ impl ApplicationState {
         &self,
         latest_block: u64,
     ) -> eyre::Result<()> {
-        let mut current_syncced_block = self.cannonical
-            .get_current_block()
-            .await?;
+        let mut current_syncced_block = self.cannonical.get_current_block();
 
         if current_syncced_block >= latest_block {
             return Ok(());
@@ -220,6 +218,7 @@ impl ApplicationState {
                 .await?
                 .wrap_err(format!("Failed to fetch block {block_number} from RPC"))?;
 
+            
             self.cannonical
                 .apply_next_block(block)
                 .await?;
@@ -316,6 +315,19 @@ fn js_value_to_uint256<'a>(
         js_val.downcast_or_throw::<JsBigInt, neon::context::FunctionContext<'a>>(cx)?;
     bigint_to_u256(down_casted, cx)
 }
+fn get_optional_bigint<'a>(
+    js_val: NeonResult<Option<Handle<'a, JsBigInt>>>,
+    cx: &mut neon::context::FunctionContext<'a>,
+) -> neon::result::NeonResult<Option<revm::primitives::U256>> {
+    match js_val {
+        eyre::Result::Ok(Some(v)) => match bigint_to_u256(v, cx) {
+            eyre::Result::Ok(v) => NeonResult::Ok(Some(v)),
+            Err(e) => cx.throw_error(e.to_string()),
+        },
+        eyre::Result::Ok(None) => NeonResult::Ok(None),
+        Err(e) => cx.throw_error(e.to_string()),
+    }
+}
 
 fn js_obj_tx_to_transaction<'a>(
     mut cx: FunctionContext<'a>,
@@ -324,17 +336,25 @@ fn js_obj_tx_to_transaction<'a>(
     let from = js_obj_tx.get_value(&mut cx, "from")?;
     let to = js_obj_tx.get_value(&mut cx, "to")?;
     let data = js_obj_tx.get_value(&mut cx, "data")?;
-    let value = js_obj_tx.get_value(&mut cx, "value")?;
+    let gas_price = get_optional_bigint(js_obj_tx.get_opt::<JsBigInt, _, _>(&mut cx, "gasPrice"), &mut cx)?;
+    let gas_limit = get_optional_bigint(js_obj_tx.get_opt::<JsBigInt, _, _>(&mut cx, "gasLimit"), &mut cx)?;
+
+    let gas_priority_fee = get_optional_bigint(js_obj_tx.get_opt::<JsBigInt, _, _>(&mut cx, "maxPriorityFeePerGas"), &mut cx)?;
+    let max_fee_per_gas = get_optional_bigint(js_obj_tx.get_opt::<JsBigInt, _, _>(&mut cx, "maxFeePerGas"), &mut cx)?;
+    let value = get_optional_bigint(js_obj_tx.get_opt::<JsBigInt, _, _>(&mut cx, "value"), &mut cx)?.unwrap_or_default();
 
     let from = js_value_to_address(&mut cx, from)?;
     let to = js_value_to_address(&mut cx, to)?;
     let data = js_value_to_bytes(&mut cx, data)?;
-    let value = js_value_to_uint256(&mut cx, value)?;
     neon::result::NeonResult::Ok(TransactionRequest {
         from,
         to,
         data,
         value,
+        gas_limit,
+        gas_price,
+        gas_priority_fee,
+        max_fee_per_gas
     })
 }
 
@@ -348,10 +368,6 @@ struct LogTracer {
 }
 
 impl LogTracer {
-    pub fn reset(&mut self) {
-        self.logs.clear();
-        self.memory_reads.clear();
-    }
     pub fn new() -> Self {
         Self {
             logs: Vec::new(),
@@ -484,15 +500,16 @@ fn instantiate_run_tx<'a>(
 
                 let tracer = LogTracer::new();
 
-                let env = active_fork.db.db.env.clone();
-                let gas_limit = env.gas_limit;
+                let block_env = active_fork.db.db.env.clone();
+                let gas_limit = tx.gas_limit.unwrap_or(block_env.gas_limit);
                 let inner_db =  active_fork.db.borrow_mut();
                 let out: Evm<'_, LogTracer, &mut CacheDB<Forked>> = revm::Evm::builder()
-                    .with_block_env(env)
+                    .with_block_env(block_env.clone())
                     .with_db(inner_db)
                     .modify_cfg_env(|f|{
                         f.memory_limit = 1024 * 1024 * 64;
                         f.disable_eip3607 = true;
+                        f.disable_balance_check = !commit;
                     })
                     .with_external_context(tracer)
                     .append_handler_register(revm::inspector_handle_register)
@@ -500,16 +517,28 @@ fn instantiate_run_tx<'a>(
                     .build();
                 let mut simulation_runner = out
                     .modify()
-                    .modify_tx_env(|env| {
+                    .modify_tx_env(|tx_env| {
                         let tx = tx.clone();
-                        env.caller = tx.from;
+                        tx_env.caller = tx.from;
                         if !tx.data.is_empty() {
-                            env.data = revm::primitives::Bytes::from(tx.data);
+                            tx_env.data = revm::primitives::Bytes::from(tx.data);
                         }
-                        env.value = tx.value;
-                        env.gas_limit = gas_limit.to();
-                        env.gas_price = revm::primitives::U256::from(1u64);
-                        env.transact_to = TransactTo::Call(tx.to);
+                        tx_env.value = tx.value;
+                        tx_env.gas_limit = gas_limit.to();
+                        
+                        tx_env.gas_priority_fee = tx.gas_priority_fee;
+
+                        if let Some(v) = tx.gas_price {
+                            tx_env.gas_price = v
+                        }
+                        match tx.gas_price {
+                            Some(v) => tx_env.gas_price = v,
+                            None => {
+                                tx_env.gas_price = block_env.basefee + U256::from(1u64);
+                            }
+                        };
+                        
+                        tx_env.transact_to = TransactTo::Call(tx.to);
                     })
                     .build();
                 
@@ -833,6 +862,8 @@ fn instantiate_set_balance_fn<'a>(
         let address = cx.argument(0)?;
         let address = js_value_to_address(&mut cx, address)?;
         let new_balance = bigint_to_u256(cx.argument::<JsBigInt>(1)?, &mut cx)?;
+
+        log::debug!(target: LOGGER_TARGET_MAIN, "setBalance({}, {})", address, new_balance);
         let (deferred, promise) = cx.promise();
         runtime(&mut cx)?.spawn(async move {
             let mut forked = db.clone().lock_owned().await;
@@ -988,6 +1019,16 @@ fn create_preload_fn<'a>(
         JsResult::Ok(p)
     })
 }
+
+// fn instantiate_reset_fn<'a>(
+//     cx: &mut TaskContext<'a>,
+//     state: ApplicationStateRef,
+// ) -> JsResult<'a, JsFunction> {
+//     JsFunction::new(cx, move |mut cx: FunctionContext| {
+//         let state = state.clone();
+//     })
+// }
+
 
 fn instantiate_set_storage_fn<'a>(
     cx: &mut TaskContext<'a>, // evm: Arc<Evm<'a,(), CacheDB<Forked>>>,

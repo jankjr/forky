@@ -39,7 +39,14 @@ interface SimTransactionRequest {
     from: string;
     to: string;
     data: string;
-    value: bigint;
+    value?: bigint;
+    gasPrice?: bigint;
+    gasLimit?: bigint;
+    maxPriorityFeePerGas?: bigint;
+    maxFeePerGas?: bigint;
+
+    // Nonces are not checked
+    nonce?: bigint;
 }
 
 export type OnLogFn = (log: Log) => void;
@@ -65,6 +72,9 @@ export interface ForkySimulator {
     onBlock: (blockNumber: number) => Promise<void>;
     fork: () => Promise<SimulatorFork>;
     preload: (address: string[]) => Promise<void>;
+
+    // Resets the simulator removing clearing database. (Can be usefull for toplevel error recovery)
+    reset: () => void;
 }
 
 /**
