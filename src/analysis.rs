@@ -1,15 +1,16 @@
-use alloy::{hex, primitives::U160};
-use evm_disassembler::{Opcode, Operation};
+use crate::opcodes::{Opcode, Operation};
+use crate::utils::is_address_like;
+use crate::{abstract_stack, abstract_value::*};
+use alloy::primitives::U160;
+use alloy::rpc::types::Block;
 use itertools::Itertools;
 use match_deref::match_deref;
 use revm::{
-    interpreter::{
-        instructions::i256::{i256_cmp, i256_div, i256_mod},
-        InstructionResult,
-    },
-    primitives::{Address, Bytecode, U256},
+    interpreter::{instructions::i256::i256_cmp, InstructionResult},
+    primitives::{keccak256, Address, BlockEnv, Bytecode, FixedBytes, U256},
 };
 
+use std::borrow::Borrow;
 use std::{
     borrow::BorrowMut,
     collections::{hash_map::Entry, HashMap, HashSet},
@@ -18,6 +19,78 @@ use std::{
     rc::Rc,
 };
 
+pub const LOGGER_TARGET_ANALYSIS: &str = "forky::analysis";
+
+#[derive(Debug, Clone)]
+pub struct AnalysisContext {
+    contract_address: U256,
+    gas_price: U256,
+    coinbase: U256,
+    block_number: U256,
+    chain_id: U256,
+    timestamp: U256,
+    block_gas_limit: U256,
+    base_fee: U256,
+    prev_randao: Option<FixedBytes<32>>,
+}
+impl Default for AnalysisContext {
+    fn default() -> Self {
+        Self {
+            chain_id: U256::from(1),
+            contract_address: U256::ZERO,
+            gas_price: U256::from(1u64),
+            block_number: U256::from(0u64),
+            coinbase: U256::ZERO,
+            timestamp: U256::from(0u64),
+            block_gas_limit: U256::from(0u64),
+            base_fee: U256::from(0u64),
+            prev_randao: None,
+        }
+    }
+}
+impl From<&BlockEnv> for AnalysisContext {
+    fn from(env: &BlockEnv) -> Self {
+        Self {
+            block_number: env.number,
+            coinbase: env.coinbase.into_word().into(),
+            gas_price: env.basefee + U256::from(1u64),
+            timestamp: env.timestamp,
+            block_gas_limit: env.gas_limit,
+            base_fee: env.basefee,
+            prev_randao: env.prevrandao,
+            ..Default::default()
+        }
+    }
+}
+impl From<&Block> for AnalysisContext {
+    fn from(block: &Block) -> Self {
+        Self {
+            block_number: U256::from(block.header.number),
+            coinbase: block.header.miner.into_word().into(),
+            gas_price: U256::from(block.header.base_fee_per_gas.unwrap_or(1u64)),
+            timestamp: U256::from(block.header.timestamp),
+            block_gas_limit: U256::from(block.header.gas_limit),
+            base_fee: U256::from(block.header.base_fee_per_gas.unwrap_or(1u64)),
+            prev_randao: block.header.mix_hash,
+            ..Default::default()
+        }
+    }
+}
+
+impl AnalysisContext {
+    pub fn with_contract_address(&self, contract_address: Address) -> Self {
+        Self {
+            contract_address: contract_address.into_word().into(),
+            ..self.clone()
+        }
+    }
+    pub fn with_chain_id(&self, chain_id: U256) -> Self {
+        Self {
+            chain_id,
+            ..self.clone()
+        }
+    }
+}
 /**
  * This code is a bit rough, but this code attempts to analyze contract code and try to predict
  * which addreses will be accessed during execution such that we can fetch them before running the
@@ -50,7 +123,7 @@ use std::{
  */
 use crate::LOGGER_TARGET_MAIN;
 
-type HeapRef<T> = Rc<T>;
+// static MAX_STEPS: usize = 4000;
 
 #[warn(dead_code)]
 fn sign_extend(ext: U256, x: U256) -> U256 {
@@ -69,454 +142,75 @@ fn sign_extend(ext: U256, x: U256) -> U256 {
     }
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash)]
-pub enum SlotType {
-    Address,
-    Uint,
-}
+static MAX_REVISITS: usize = 7;
 
-impl Display for SlotType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-
-impl SlotType {
-    fn promote(&self, other: &SlotType) -> SlotType {
-        match (self, other) {
-            (SlotType::Address, _) => SlotType::Address,
-            (_, SlotType::Address) => SlotType::Address,
-            _ => SlotType::Uint,
-        }
-    }
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum AbstractValue {
-    Calldata(usize),
-    Const(U256),
-    AddressConst(Address),
-    OpcodeResult(Opcode),
-    CREATE(
-        HeapRef<AbstractValue>,
-        HeapRef<AbstractValue>,
-        HeapRef<AbstractValue>,
-    ),
-    CREATE2(
-        HeapRef<AbstractValue>,
-        HeapRef<AbstractValue>,
-        HeapRef<AbstractValue>,
-        HeapRef<AbstractValue>,
-    ),
-    CallResult {
-        op: Opcode,
-        gas: HeapRef<AbstractValue>,
-        address: HeapRef<AbstractValue>,
-        value: Option<HeapRef<AbstractValue>>,
-        selector: Option<HeapRef<AbstractValue>>,
-        args: Vec<HeapRef<AbstractValue>>,
-    },
-    UnaryOpResult(Opcode, HeapRef<AbstractValue>),
-    BinOpResult(Opcode, HeapRef<AbstractValue>, HeapRef<AbstractValue>),
-    TertiaryOpResult(
-        Opcode,
-        HeapRef<AbstractValue>,
-        HeapRef<AbstractValue>,
-        HeapRef<AbstractValue>,
-    ),
-    StorageArray(HeapRef<AbstractValue>),
-    StorageSlot(SlotType, U256),
-    Mapping(SlotType, HeapRef<AbstractValue>),
-    AddressRef(HeapRef<AbstractValue>),
-}
-
-type AbstractValueRef = HeapRef<AbstractValue>;
-
-static ADDR_MASK: U256 = U256::from_be_slice(&hex!("ffffffffffffffffffffffffffffffffffffffff"));
-
-// static SIZE_MASKS: [U256; 31] = [
-//     U256::from_be_slice(&hex!("ff")),
-//     U256::from_be_slice(&hex!("ffff")),
-//     U256::from_be_slice(&hex!("ffffff")),
-//     U256::from_be_slice(&hex!("ffffffff")),
-//     U256::from_be_slice(&hex!("ffffffffff")),
-//     U256::from_be_slice(&hex!("ffffffffffff")),
-//     U256::from_be_slice(&hex!("ffffffffffffff")),
-//     U256::from_be_slice(&hex!("ffffffffffffffff")),
-//     U256::from_be_slice(&hex!("ffffffffffffffffff")),
-//     U256::from_be_slice(&hex!("ffffffffffffffffffff")),
-//     U256::from_be_slice(&hex!("ffffffffffffffffffffff")),
-//     U256::from_be_slice(&hex!("ffffffffffffffffffffffff")),
-//     U256::from_be_slice(&hex!("ffffffffffffffffffffffffff")),
-//     U256::from_be_slice(&hex!("ffffffffffffffffffffffffffff")),
-//     U256::from_be_slice(&hex!("ffffffffffffffffffffffffffffff")),
-//     U256::from_be_slice(&hex!("ffffffffffffffffffffffffffffffff")),
-//     U256::from_be_slice(&hex!("ffffffffffffffffffffffffffffffffff")),
-//     U256::from_be_slice(&hex!("ffffffffffffffffffffffffffffffffffff")),
-//     U256::from_be_slice(&hex!("ffffffffffffffffffffffffffffffffffffff")),
-//     U256::from_be_slice(&hex!("ffffffffffffffffffffffffffffffffffffffff")),
-//     U256::from_be_slice(&hex!("ffffffffffffffffffffffffffffffffffffffffff")),
-//     U256::from_be_slice(&hex!("ffffffffffffffffffffffffffffffffffffffffffff")),
-//     U256::from_be_slice(&hex!("ffffffffffffffffffffffffffffffffffffffffffffff")),
-//     U256::from_be_slice(&hex!("ffffffffffffffffffffffffffffffffffffffffffffffff")),
-//     U256::from_be_slice(&hex!("ffffffffffffffffffffffffffffffffffffffffffffffffff")),
-//     U256::from_be_slice(&hex!(
-//         "ffffffffffffffffffffffffffffffffffffffffffffffffffff"
-//     )),
-//     U256::from_be_slice(&hex!(
-//         "ffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-//     )),
-//     U256::from_be_slice(&hex!(
-//         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-//     )),
-//     U256::from_be_slice(&hex!(
-//         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-//     )),
-//     U256::from_be_slice(&hex!(
-//         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-//     )),
-//     U256::from_be_slice(&hex!(
-//         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-//     )),
-// ];
-
-impl ToString for AbstractValue {
-    fn to_string(&self) -> String {
-        match self {
-            AbstractValue::AddressRef(inner) => format!("Address({})", inner.to_string()),
-            AbstractValue::AddressConst(inner) => format!("{}", inner.to_string()),
-            AbstractValue::Mapping(arg_t, slot) => {
-                format!("mapping({:?} => {})", arg_t, slot.to_string())
-            }
-            AbstractValue::CallResult {
-                op,
-                gas: _,
-                address,
-                value,
-                selector,
-                args,
-            } => {
-                let sel = match selector {
-                    Some(v) => match &**v {
-                        AbstractValue::Const(v) => {
-                            let selector_bytes = (v.as_limbs()[0] >> 4) as u32;
-                            format!(":{}", hex::encode(selector_bytes.to_le_bytes()))
-                        }
-                        _ => format!(":{:?}", v),
-                    },
-                    None => ":?".to_string(),
-                };
-
-                match value {
-                    Some(value) => format!(
-                        "{:?}{}.{}[value:{:?}]({})",
-                        op,
-                        sel,
-                        address.to_string(),
-                        value,
-                        args.iter().map(|v| v.to_string()).join(", ")
-                    ),
-                    None => format!(
-                        "{:?}{}.{}({})",
-                        op,
-                        sel,
-                        address.to_string(),
-                        args.iter().map(|v| v.to_string()).join(", ")
-                    ),
-                }
-            }
-            _ => format!("{:?}", self),
-        }
-    }
-}
-impl AbstractValue {
-    fn bin(op: Opcode, a: AbstractValueRef, b: AbstractValueRef) -> AbstractValueRef {
-        let v = match_deref! {
-            match (op, &a, &b) {
-                (Opcode::ADD, Deref@AbstractValue::Const(a), Deref@AbstractValue::Const(b)) => {
-                    AbstractValue::Const(a.wrapping_add(*b))
-                }
-                (Opcode::ADD, Deref@AbstractValue::Const(a), Deref@AbstractValue::BinOpResult(Opcode::ADD, Deref@AbstractValue::Const(b), exp)) => {
-                    AbstractValue::BinOpResult(Opcode::ADD, AbstractValue::val(&a.wrapping_add(*b)), exp.clone())
-                }
-                (Opcode::AND, Deref@AbstractValue::Const(a), Deref@AbstractValue::Const(b)) => {
-                    return AbstractValue::val(&(a & b));
-                }
-                (Opcode::AND, exp, Deref@AbstractValue::Const(v)) => {
-                    return AbstractValue::bin(Opcode::AND, AbstractValue::val(v), exp.clone());
-                }
-                (Opcode::DIV, exp, Deref@AbstractValue::Const(v)) => {
-                    if v.eq(&U256::from(1)) {
-                        return exp.clone();
-                    }
-                    AbstractValue::BinOpResult(op, a.clone(), b.clone())
-                }
-                (Opcode::AND, Deref@AbstractValue::Const(v), Deref@AbstractValue::AddressRef(inner)) => {
-                    if v.eq(&ADDR_MASK) {
-                        return HeapRef::new(AbstractValue::AddressRef(inner.clone()))
-                    }
-                    AbstractValue::BinOpResult(Opcode::AND, AbstractValue::val(v), HeapRef::new(AbstractValue::AddressRef(inner.clone())))
-                }
-                (Opcode::AND, Deref@AbstractValue::Const(v), exp) => {
-                    if v.eq(&ADDR_MASK) {
-                        return HeapRef::new(AbstractValue::AddressRef(exp.clone()))
-                    }
-                    AbstractValue::BinOpResult(Opcode::AND, AbstractValue::val(v), exp.clone())
-                }
-                (Opcode::ADD, exp, Deref@AbstractValue::Const(b)) => {
-                    return AbstractValue::bin(Opcode::ADD, AbstractValue::val(b), exp.clone());
-                }
-
-                (Opcode::MUL, Deref@AbstractValue::Const(_), Deref@AbstractValue::Const(_)) => {
-                    AbstractValue::BinOpResult(op, a, b)
-                }
-                (Opcode::MUL, exp, Deref@AbstractValue::Const(b)) => {
-                    AbstractValue::BinOpResult(op, AbstractValue::val(b), exp.clone())
-                }
-
-                _ => AbstractValue::BinOpResult(op, a.clone(), b.clone())
-            }
-        };
-
-        HeapRef::new(v)
-    }
-    fn map(input: SlotType, a: AbstractValueRef) -> AbstractValueRef {
-        HeapRef::new(AbstractValue::Mapping(input, a.clone()))
-    }
-    fn array(a: AbstractValueRef) -> AbstractValueRef {
-        HeapRef::new(AbstractValue::StorageArray(a.clone()))
-    }
-    fn unary(op: Opcode, a: AbstractValueRef) -> AbstractValueRef {
-        HeapRef::new(AbstractValue::UnaryOpResult(op, a.clone()))
-    }
-    fn op(op: Opcode) -> AbstractValueRef {
-        HeapRef::new(AbstractValue::OpcodeResult(op))
-    }
-    fn val(a: &U256) -> AbstractValueRef {
-        HeapRef::new(AbstractValue::Const(*a))
-    }
-
-    fn ext_call(
-        op: Opcode,
-        gas: AbstractValueRef,
-        address: AbstractValueRef,
-        value: AbstractValueRef,
-        selector: Option<AbstractValueRef>,
-        args: Vec<AbstractValueRef>,
-    ) -> AbstractValue {
-        AbstractValue::CallResult {
-            op,
-            gas,
-            address: reduce_externals(&address),
-            value: Some(value),
-            selector,
-            args,
-        }
-    }
-
-    fn static_or_delegate_call(
-        op: Opcode,
-        gas: AbstractValueRef,
-        address: AbstractValueRef,
-        selector: Option<AbstractValueRef>,
-        args: Vec<AbstractValueRef>,
-    ) -> AbstractValue {
-        AbstractValue::CallResult {
-            op,
-            gas,
-            address: reduce_externals(&address),
-            value: None,
-            selector,
-            args,
-        }
-    }
-}
-
-pub fn decode_operation(
-    bytes: &mut dyn ExactSizeIterator<Item = u8>,
-    cur_offset: u32,
-) -> eyre::Result<(Operation, u32)> {
-    let encoded_opcode = bytes.next().expect("Unexpected end of input");
-    let num_bytes = match encoded_opcode {
+pub fn decode_operation<'a>(
+    bytes: &'a [u8],
+    cur_offset: usize,
+) -> eyre::Result<(Operation, usize)> {
+    let encoded_opcode = bytes.get(cur_offset).expect("Unexpected end of input");
+    let num_bytes = match *encoded_opcode {
         0x60..=0x7f => encoded_opcode - 0x5f,
         _ => 0,
-    };
+    } as usize;
 
-    let mut new_offset = cur_offset + 1;
-    let opcode = Opcode::from_byte(encoded_opcode);
-    let mut operation = Operation::new(opcode, cur_offset);
+    let opcode = Opcode::from_byte(*encoded_opcode);
     if num_bytes > 0 {
-        new_offset += num_bytes as u32;
-        operation = operation.with_bytes(num_bytes, bytes)?
-    };
-    Ok((operation, new_offset))
+        let input_start = cur_offset + 1;
+        let input_end = input_start + num_bytes;
+
+        if input_end > bytes.len() {
+            return Err(eyre::eyre!("Invalid opcode {:?}", opcode));
+        }
+
+        Ok((
+            Operation::new(opcode, cur_offset, &bytes[input_start..input_end]),
+            input_end,
+        ))
+    } else {
+        Ok((
+            Operation::new(opcode, cur_offset, &bytes[0..0]),
+            cur_offset + 1,
+        ))
+    }
 }
 
-pub fn disassemble_bytes(bytes: Vec<u8>) -> Vec<Operation> {
+pub fn disassemble_bytes<'a>(bytes: &'a [u8]) -> Vec<Operation<'a>> {
     let mut operations = Vec::new();
-    let mut new_operation: Operation;
     let mut offset = 0;
-    let mut bytes_iter = bytes.into_iter();
-    while bytes_iter.len() > 0 {
-        (new_operation, offset) = match decode_operation(&mut bytes_iter, offset) {
-            Ok((operation, new_offset)) => (operation, new_offset),
+
+    let mut len = bytes.len();
+    if bytes.len() > 128 {
+        for i in 1..128usize {
+            let cursor = bytes.len() - i;
+            let s = &bytes[cursor - 2..cursor];
+            if s == [0xa2, 0x64] {
+                len = cursor;
+                break;
+            }
+        }
+    }
+
+    while offset < len {
+        match decode_operation(bytes, offset) {
+            Ok((operation, new_offset)) => {
+                operations.push(operation);
+                offset = new_offset;
+            }
             Err(e) => {
+                log::trace!(target: LOGGER_TARGET_MAIN, "Failed to decode opcode {:?}", e);
                 break;
             }
         };
-        operations.push(new_operation);
     }
     operations
-}
-
-fn is_push(opcode: Opcode) -> bool {
-    match opcode {
-        Opcode::PUSH0
-        | Opcode::PUSH1
-        | Opcode::PUSH2
-        | Opcode::PUSH3
-        | Opcode::PUSH4
-        | Opcode::PUSH5
-        | Opcode::PUSH6
-        | Opcode::PUSH7
-        | Opcode::PUSH8
-        | Opcode::PUSH9
-        | Opcode::PUSH10
-        | Opcode::PUSH11
-        | Opcode::PUSH12
-        | Opcode::PUSH13
-        | Opcode::PUSH14
-        | Opcode::PUSH15
-        | Opcode::PUSH16
-        | Opcode::PUSH17
-        | Opcode::PUSH18
-        | Opcode::PUSH19
-        | Opcode::PUSH20
-        | Opcode::PUSH21
-        | Opcode::PUSH22
-        | Opcode::PUSH23
-        | Opcode::PUSH24
-        | Opcode::PUSH25
-        | Opcode::PUSH26
-        | Opcode::PUSH27
-        | Opcode::PUSH28
-        | Opcode::PUSH29
-        | Opcode::PUSH30
-        | Opcode::PUSH31
-        | Opcode::PUSH32 => true,
-        _ => false,
-    }
-}
-
-macro_rules! debug_unreachable {
-    ($($t:tt)*) => {
-        if cfg!(debug_assertions) {
-            unreachable!($($t)*);
-        } else {
-            unsafe { core::hint::unreachable_unchecked() };
-        }
-    };
-}
-
-macro_rules! assume {
-    ($e:expr $(,)?) => {
-        if !$e {
-            debug_unreachable!(stringify!($e));
-        }
-    };
-
-    ($e:expr, $($t:tt)+) => {
-        if !$e {
-            debug_unreachable!($($t)+);
-        }
-    };
-}
-
-pub const STACK_LIMIT: usize = 1024;
-#[derive(Debug)]
-struct AbstractStack {
-    data: Vec<HeapRef<AbstractValue>>,
-}
-impl AbstractStack {
-    pub fn copy(&self) -> Self {
-        let mut d = Vec::with_capacity(STACK_LIMIT);
-        for v in self.data.iter() {
-            d.push(v.clone());
-        }
-        Self { data: d }
-    }
-    pub fn new() -> Self {
-        Self {
-            data: Vec::with_capacity(STACK_LIMIT),
-        }
-    }
-
-    #[inline]
-    pub fn pop(&mut self) -> Result<HeapRef<AbstractValue>, InstructionResult> {
-        match self.data.pop() {
-            Some(v) => Ok(v.clone()),
-            None => Err(InstructionResult::StackUnderflow),
-        }
-    }
-
-    /// Push a new value onto the stack.
-    ///
-    /// If it will exceed the stack limit, returns `StackOverflow` error and leaves the stack
-    /// unchanged.
-    #[inline]
-    pub fn push(&mut self, value: HeapRef<AbstractValue>) -> Result<(), InstructionResult> {
-        // Allows the compiler to optimize out the `Vec::push` capacity check.
-        assume!(self.data.capacity() == STACK_LIMIT);
-        if self.data.len() == STACK_LIMIT {
-            return Err(InstructionResult::StackOverflow);
-        }
-        self.data.push(value);
-        Ok(())
-    }
-
-    #[inline]
-    pub fn push_uint(&mut self, value: u64) -> Result<(), InstructionResult> {
-        let out = AbstractValue::Const(U256::from(value));
-        self.push(HeapRef::new(out))
-    }
-
-    #[inline]
-    pub fn dup(&mut self, n: usize) -> Result<(), InstructionResult> {
-        assume!(n > 0, "attempted to dup 0");
-        if n > self.data.len() {
-            // println!("dup: stack underflow");
-            return Err(InstructionResult::StackUnderflow);
-        }
-        let element = self.data.get(self.data.len() - n);
-        match element {
-            None => Err(InstructionResult::StackOverflow),
-            Some(v) => {
-                self.data.push(v.clone());
-                Ok(())
-            }
-        }
-    }
-
-    /// Swaps the topmost value with the `N`th value from the top.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `n` is 0.
-    #[inline(always)]
-    pub fn swap(&mut self, nth: usize) -> Result<(), InstructionResult> {
-        let top = self.data.len();
-        if nth >= top {
-            return Err(InstructionResult::StackOverflow);
-        }
-        self.data.swap(top - 1, top - nth - 1);
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone)]
 enum AbstractMemoryValue {
     Abstract {
         size: usize,
-        value: HeapRef<AbstractValue>,
+        value: AbstractValueRef,
     },
     Bytes(Vec<u8>),
 }
@@ -534,12 +228,17 @@ impl AbstractMemory {
 
     fn load_args(
         &self,
-        offset: &HeapRef<AbstractValue>,
-        size: &HeapRef<AbstractValue>,
-    ) -> (Option<HeapRef<AbstractValue>>, Vec<HeapRef<AbstractValue>>) {
+        offset: &AbstractValueRef,
+        size: &AbstractValueRef,
+    ) -> (Option<AbstractValueRef>, Vec<AbstractValueRef>) {
         let (mut offset, mut size): (usize, usize) = match_deref::match_deref! {
             match (offset, size) {
-                (Deref @ AbstractValue::Const(offset), Deref @ AbstractValue::Const(size)) => (offset.to(), size.to()),
+                (Deref @ AbstractValue::Const(offset), Deref @ AbstractValue::Const(size)) => {
+                    if size.gt(&U256::from(100000)) || offset.gt(&U256::from(100000)) {
+                        return (None, Vec::new());
+                    }
+                    (offset.to(), size.to())
+                },
                 (Deref @ AbstractValue::Const(offset), _) => (offset.to(), 4),
                 _ => return (None, Vec::new())
             }
@@ -603,11 +302,11 @@ impl AbstractMemory {
         }
         return AbstractMemoryValue::Abstract {
             size: read_size,
-            value: HeapRef::new(AbstractValue::BinOpResult(
+            value: AbstractValue::bin(
                 Opcode::MLOAD,
                 HeapRef::new(AbstractValue::Const(U256::from(offset))),
                 HeapRef::new(AbstractValue::Const(U256::from(read_size))),
-            )),
+            ),
         };
     }
 
@@ -617,7 +316,7 @@ impl AbstractMemory {
     }
 
     #[inline]
-    fn mstore(&mut self, offset: HeapRef<AbstractValue>, value: HeapRef<AbstractValue>) {
+    fn mstore(&mut self, offset: AbstractValueRef, value: AbstractValueRef) {
         let offset: usize = match_deref::match_deref! {
             match &offset {
                 Deref @ AbstractValue::Const(v) => v.to(),
@@ -634,7 +333,7 @@ impl AbstractMemory {
     }
 
     #[inline]
-    fn mstore8(&mut self, offset: HeapRef<AbstractValue>, value: HeapRef<AbstractValue>) {
+    fn mstore8(&mut self, offset: AbstractValueRef, value: AbstractValueRef) {
         let offset: usize = match_deref::match_deref! {
             match &offset {
                     Deref @  AbstractValue::Const(v) => v.to(),
@@ -650,7 +349,7 @@ impl AbstractMemory {
         );
     }
     #[inline]
-    fn get_word(&self, offset: usize) -> Option<HeapRef<AbstractValue>> {
+    fn get_word(&self, offset: usize) -> Option<AbstractValueRef> {
         return match self.backing.get(&offset) {
             Some(v) => Some(match v {
                 AbstractMemoryValue::Abstract { size, value } => value.clone(),
@@ -671,7 +370,7 @@ impl AbstractMemory {
         };
     }
     #[inline]
-    fn load(&self, offset_v: HeapRef<AbstractValue>) -> Option<HeapRef<AbstractValue>> {
+    fn load(&self, offset_v: AbstractValueRef) -> Option<AbstractValueRef> {
         let offset = match_deref::match_deref! {
             match &offset_v {
                 Deref @ AbstractValue::Const(v) => {
@@ -687,54 +386,20 @@ impl AbstractMemory {
     }
 }
 
-fn infer_type(v: &HeapRef<AbstractValue>) -> SlotType {
-    match **v {
-        AbstractValue::AddressRef(_) => SlotType::Address,
-        _ => SlotType::Uint,
-    }
-}
-
-fn reduce_externals(v: &HeapRef<AbstractValue>) -> HeapRef<AbstractValue> {
-    use AbstractValue::*;
-
-    HeapRef::new(match_deref! {
-        match v {
-            Deref @ Const(v) => AddressConst(Address::from(U160::from(*v))),
-            v => return reduce(v)
-        }
-    })
-}
-
-fn reduce(v: &HeapRef<AbstractValue>) -> HeapRef<AbstractValue> {
-    use AbstractValue::*;
-    use Opcode::*;
-
-    match_deref! {
-        match v {
-            Deref @ AddressRef(inner) => return HeapRef::new(AddressRef(reduce(&inner))),
-            Deref @ UnaryOpResult(SLOAD, Deref @ Const(v)) => return HeapRef::new(StorageSlot(SlotType::Uint, *v)),
-            Deref @ UnaryOpResult(SLOAD, Deref @ UnaryOpResult(SHA3, Deref@Const(v))) => return HeapRef::new(StorageArray(HeapRef::new(StorageSlot(SlotType::Uint, *v)))),
-            Deref @ UnaryOpResult(SLOAD, Deref @ BinOpResult(SHA3, arg1, Deref @ BinOpResult(SHA3, arg0, Deref @ Const(v)))) => return AbstractValue::map(infer_type(arg0), AbstractValue::map(infer_type(arg1), HeapRef::new(StorageSlot(SlotType::Uint, *v)))),
-            Deref @ UnaryOpResult(SLOAD, Deref @ BinOpResult(SHA3, arg0, Deref @ Const(v))) => return AbstractValue::map(infer_type(arg0), HeapRef::new(StorageSlot(SlotType::Uint, *v))),
-            Deref @ UnaryOpResult(SLOAD, Deref @ BinOpResult(ADD, Deref@Const(_), Deref@UnaryOpResult(SHA3, exp))) => return AbstractValue::array(reduce(exp)),
-            Deref @ UnaryOpResult(SLOAD, Deref @ BinOpResult(ADD, Deref@Const(_), Deref@BinOpResult(SHA3, arg0, Deref@Const(v)))) => return AbstractValue::map(infer_type(arg0), HeapRef::new(StorageSlot(SlotType::Uint, *v))),
-            Deref @ UnaryOpResult(SLOAD, Deref @ BinOpResult(ADD, Deref@Const(_), Deref@BinOpResult(SHA3, arg1, Deref @ BinOpResult(SHA3, arg0, Deref @ Const(v))))) => return AbstractValue::map(infer_type(arg0), AbstractValue::map(infer_type(arg1), HeapRef::new(StorageSlot(SlotType::Uint, *v)))),
-            Deref @ Const(v) => return HeapRef::new(StorageSlot(SlotType::Uint, *v)),
-            _ => {}
-        }
-    };
-
-    return v.clone();
-}
-
 #[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash)]
 pub enum AnalyzedStoragesSlot {
     Slot(U256, SlotType),
     Array(U256, SlotType),
-    Mapping(U256, Vec<SlotType>, SlotType),
+    Mapping(U256, Vec<SlotType>, SlotType, Vec<Vec<ArgType>>),
 }
 
 impl AnalyzedStoragesSlot {
+    pub fn is_mapping(&self) -> bool {
+        match self {
+            AnalyzedStoragesSlot::Mapping(_, _, _, _) => true,
+            _ => false,
+        }
+    }
     fn promote(&self, other: &AnalyzedStoragesSlot) -> Self {
         match (self, other) {
             (AnalyzedStoragesSlot::Slot(slot, typ), AnalyzedStoragesSlot::Array(_, other_typ)) => {
@@ -742,12 +407,47 @@ impl AnalyzedStoragesSlot {
             }
             (
                 AnalyzedStoragesSlot::Slot(slot, typ),
-                AnalyzedStoragesSlot::Mapping(_, other_map, other_typ),
-            ) => AnalyzedStoragesSlot::Mapping(*slot, other_map.clone(), typ.promote(other_typ)),
+                AnalyzedStoragesSlot::Mapping(_, other_map, other_typ, args),
+            ) => AnalyzedStoragesSlot::Mapping(
+                *slot,
+                other_map.clone(),
+                typ.promote(other_typ),
+                args.clone(),
+            ),
             (
                 AnalyzedStoragesSlot::Array(slot, typ),
-                AnalyzedStoragesSlot::Mapping(_, other_map, other_typ),
-            ) => AnalyzedStoragesSlot::Mapping(*slot, other_map.clone(), typ.promote(other_typ)),
+                AnalyzedStoragesSlot::Mapping(_, other_map, other_typ, args),
+            ) => AnalyzedStoragesSlot::Mapping(
+                *slot,
+                other_map.clone(),
+                typ.promote(other_typ),
+                args.clone(),
+            ),
+            (
+                AnalyzedStoragesSlot::Mapping(_, map0, t0, arg0),
+                AnalyzedStoragesSlot::Mapping(slot, map1, t1, arg1),
+            ) => {
+                let mapping = if map0.len() > map1.len() {
+                    map0.clone()
+                } else if map1.len() > map0.len() {
+                    map1.clone()
+                } else {
+                    map0.iter()
+                        .zip(map1.iter())
+                        .map(|(a, b)| a.promote(b))
+                        .collect::<Vec<_>>()
+                };
+
+                let args = arg0
+                    .iter()
+                    .chain(arg1.iter())
+                    .cloned()
+                    .filter(|v| v.len() == mapping.len())
+                    .unique()
+                    .collect::<Vec<_>>();
+
+                AnalyzedStoragesSlot::Mapping(*slot, mapping, t0.promote(t1), args)
+            }
             _ => self.promote_type(&other.get_type()),
         }
     }
@@ -757,11 +457,21 @@ impl AnalyzedStoragesSlot {
                 AnalyzedStoragesSlot::Slot(*slot, typ.promote(new_type))
             }
             AnalyzedStoragesSlot::Array(slot, typ) => {
-                AnalyzedStoragesSlot::Array(*slot, typ.promote(new_type))
+                if let SlotType::Tuple(_) = new_type {
+                    return self.clone();
+                }
+                if new_type == &SlotType::String {
+                    AnalyzedStoragesSlot::Slot(*slot, SlotType::String)
+                } else {
+                    AnalyzedStoragesSlot::Array(*slot, typ.promote(new_type))
+                }
             }
-            AnalyzedStoragesSlot::Mapping(slot, map, typ) => {
-                AnalyzedStoragesSlot::Mapping(*slot, map.clone(), typ.promote(new_type))
-            }
+            AnalyzedStoragesSlot::Mapping(slot, map, typ, args) => AnalyzedStoragesSlot::Mapping(
+                *slot,
+                map.clone(),
+                typ.promote(new_type),
+                args.clone(),
+            ),
         }
     }
 
@@ -769,13 +479,13 @@ impl AnalyzedStoragesSlot {
         match self {
             AnalyzedStoragesSlot::Slot(slot, _) => *slot,
             AnalyzedStoragesSlot::Array(slot, _) => *slot,
-            AnalyzedStoragesSlot::Mapping(slot, __, _) => *slot,
+            AnalyzedStoragesSlot::Mapping(slot, __, _, _) => *slot,
         }
     }
 
     fn get_mapping(&self) -> Vec<SlotType> {
         match self {
-            AnalyzedStoragesSlot::Mapping(_, map, _) => map.clone(),
+            AnalyzedStoragesSlot::Mapping(_, map, _, _) => map.clone(),
             _ => vec![],
         }
     }
@@ -784,7 +494,7 @@ impl AnalyzedStoragesSlot {
         match self {
             AnalyzedStoragesSlot::Slot(_, typ) => typ.clone(),
             AnalyzedStoragesSlot::Array(_, typ) => typ.clone(),
-            AnalyzedStoragesSlot::Mapping(_, _, typ) => typ.clone(),
+            AnalyzedStoragesSlot::Mapping(_, _, typ, _) => typ.clone(),
         }
     }
 }
@@ -793,164 +503,143 @@ impl Display for AnalyzedStoragesSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AnalyzedStoragesSlot::Slot(slot, typ) => write!(f, "Slot({slot}, {typ:?})"),
-            AnalyzedStoragesSlot::Array(slot, typ) => write!(f, "Slot({slot}, {typ:?}[])"),
-            AnalyzedStoragesSlot::Mapping(slot, map, typ) => write!(
+            AnalyzedStoragesSlot::Array(slot, typ) => {
+                let start: U256 = keccak256(slot.to_be_bytes::<32>().as_slice()).into();
+                write!(f, "Slot({slot}, {typ:?}[]) array_start={}", start)
+            }
+            AnalyzedStoragesSlot::Mapping(slot, map, typ, args) => write!(
                 f,
-                "Slot({slot}, mapping({} => {}))",
+                "Slot({slot}, mapping({} => {}), args={:?})",
                 map.iter().join(" => "),
-                typ
+                typ,
+                args
             ),
         }
     }
 }
 
-fn convert(v: &HeapRef<AbstractValue>) -> Option<AnalyzedStoragesSlot> {
-    use AbstractValue::*;
+fn convert(
+    v: &AbstractValueRef,
+    arg_source: &Vec<ArgType>,
+    selector: u32,
+) -> Option<AnalyzedStoragesSlot> {
+    use crate::abstract_value::AbstractValue::*;
     let out = match_deref! {
         match v {
-            Deref @ StorageSlot(typ, slot) => AnalyzedStoragesSlot::Slot(*slot, typ.clone()),
-            Deref @ AddressRef(inner) => return convert(inner).map(|v| v.promote_type(&SlotType::Address)),
+            Deref @ StorageSlot(typ, slot) => Some(AnalyzedStoragesSlot::Slot(*slot, typ.clone())),
+            Deref @ TypeMask(t, inner) => convert(inner, arg_source, selector).map(|v| v.promote_type(&t)),
             Deref @ StorageArray(slot) => {
-                let slot = convert(slot)?;
-                AnalyzedStoragesSlot::Array(slot.get_slot(), slot.get_type())
+                let slot = convert(slot, &Vec::new(), selector)?;
+                Some(AnalyzedStoragesSlot::Array(slot.get_slot(), slot.get_type()))
             }
             Deref @ Mapping(arg_type, slot) => {
-                let slot = convert(slot)?;
+                let arg_source = arg_source.iter().map(|i|i.clone()).unique().collect::<Vec<_>>();
+                let slot = convert(slot, &arg_source, selector)?;
                 let mut mapping = vec![arg_type.clone()];
                 mapping.extend(slot.get_mapping());
-
-                AnalyzedStoragesSlot::Mapping(slot.get_slot(), mapping , slot.get_type())
+                Some(
+                AnalyzedStoragesSlot::Mapping(slot.get_slot(), mapping, slot.get_type(), vec![
+                    arg_source
+                ]))
             }
-            _ => return None
+            _ => {
+                return None
+            }
         }
     };
-    Some(out)
-}
 
-macro_rules! pop_or_break {
-    ($stack:expr) => {{
-        match $stack.pop() {
-            Err(_) => {
-                // println!("pop_or_break failed {:?}", e);
-                return StepResult::Stop;
-            }
-            Ok(v) => v.clone(),
-        }
-    }};
+    out
 }
 
 macro_rules! handle_unary {
-    ($stack:expr, $op:ident, $f:expr) => {
-        let val = pop_or_break!($stack);
+    ($stack:expr, $op:ident, $f:expr) => {{
+        let val = $stack.pop()?;
+
         match_deref::match_deref! {
             match &val {
                 Deref @ AbstractValue::Const(v) => {
-                    let out: U256 = U256::from($f(v));
-                    push_or_break!($stack, HeapRef::new(AbstractValue::Const(out)));
+                    $stack.push(AbstractValue::val(&U256::from($f(v))))?;
                 }
                 _ => {
-                    push_or_break_val!(
-                        $stack,
-                        AbstractValue::UnaryOpResult(Opcode::$op, val.clone())
-                    );
+                    $stack.push(AbstractValue::unary(Opcode::$op, val.clone()))?;
                 }
             }
-        }
-    };
-}
-
-macro_rules! push_or_break {
-    ($stack:expr, $n:expr) => {{
-        match $stack.push($n.clone()) {
-            Err(_) => {
-                return StepResult::Stop;
-            }
-            Ok(_) => {}
-        }
-    }};
-}
-macro_rules! push_or_break_val {
-    ($stack:expr, $n:expr) => {{
-        match $stack.push(HeapRef::new($n)) {
-            Err(_) => {
-                return StepResult::Stop;
-            }
-            Ok(_) => {}
-        }
+        };
     }};
 }
 
 macro_rules! handle_bin {
-    ($stack:expr, $op:expr, $opName:ident) => {
-        let a = pop_or_break!($stack);
-        let b = pop_or_break!($stack);
+    ($stack:expr, $op:tt, $opName:ident) => {{
+        let a = $stack.pop()?;
+        let b = $stack.pop()?;
+        match_deref::match_deref! {
+            match (&a, &b) {
+                (Deref@AbstractValue::Const(a), Deref@AbstractValue::Const(b)) => {
+                    let res = U256::from(a.clone() $op b.clone());
+
+                    $stack.push(HeapRef::new(AbstractValue::Const(res)))?;
+                }
+                _ => {
+                    $stack.push(AbstractValue::bin(Opcode::$opName, a.clone(), b.clone()))?;
+                }
+            }
+        };
+    }};
+    ($stack:expr, $op:expr, $opName:ident) => {{
+        let a = $stack.pop()?;
+        let b = $stack.pop()?;
         match_deref::match_deref! {
             match (&a, &b) {
                 (Deref@AbstractValue::Const(a), Deref@AbstractValue::Const(b)) => {
                     let res = U256::from($op(a.clone(), b.clone()));
                     // println!("{} {:?} {:?} -> {:?}", stringify!($opName), a, b, res);
-                    push_or_break!($stack, HeapRef::new(AbstractValue::Const(res)));
+                    $stack.push(HeapRef::new(AbstractValue::Const(res)))?;
                 }
                 _ => {
-                    push_or_break!(
-                        $stack,
-                        AbstractValue::bin(Opcode::$opName, a.clone(), b.clone())
-                    );
+                    $stack.push(AbstractValue::bin(Opcode::$opName, a.clone(), b.clone()))?;
                 }
             }
-        }
-    };
+        };
+    }};
 }
 
 macro_rules! handle_shift_op {
-    ($stack:expr, $op:expr, $opName:ident) => {
-        let shift = pop_or_break!($stack);
-        let value = pop_or_break!($stack);
+    ($stack:expr, $op:expr, $opName:ident, $max:expr) => {{
+        let shift = $stack.pop()?;
+        let value = $stack.pop()?;
         match_deref::match_deref! {
             match (&shift, &value) {
                 (Deref @ AbstractValue::Const(shift), Deref @ AbstractValue::Const(value)) => {
-                    let shift: usize = shift.to();
-                    let res = U256::from($op(*value, shift));
-                    // println!("{} {:?} {:?} -> {:?}", stringify!($opName), shift, value, res);
-                    push_or_break!($stack, HeapRef::new(AbstractValue::Const(res)));
+                    if shift.gt(&U256::from(255)) {
+                        $stack.push(HeapRef::new(AbstractValue::Const($max)))?;
+                    } else {
+                        let shift: usize = shift.to();
+                        let res = U256::from($op(*value, shift));
+                        $stack.push(HeapRef::new(AbstractValue::Const(res)))?;
+                    }
                 }
-                _ => {
-                    push_or_break!(
-                        $stack,
-                        AbstractValue::bin(Opcode::$opName, shift.clone(), value.clone())
-                    );
-                }
-            }
-        }
-    };
-}
 
-macro_rules! handle_bin_op {
-    ($stack:expr, $op:tt, $opName:ident) => {
-        let a = pop_or_break!($stack);
-        let b = pop_or_break!($stack);
-        match_deref::match_deref! {
-            match (&a, &b) {
-                (Deref@AbstractValue::Const(a), Deref@AbstractValue::Const(b)) => {
-                    let res = U256::from(a.clone() $op b.clone());
-                    // println!("{} {:?} {:?} -> {:?}", stringify!($opName), a, b, res);
-                    push_or_break!($stack, HeapRef::new(AbstractValue::Const(res)));
+                (Deref @ AbstractValue::Const(shift_value), _) => {
+                    if shift_value.gt(&U256::from(255)) {
+                        $stack.push(HeapRef::new(AbstractValue::Const($max)))?;
+                    } else {
+                        $stack.push(AbstractValue::bin(Opcode::$opName, shift.clone(), value.clone()))?;
+                    }
                 }
                 _ => {
-                    push_or_break!(
-                        $stack,
-                        AbstractValue::bin(Opcode::$opName, a.clone(), b.clone())
-                    );
+                    $stack.push(AbstractValue::bin(Opcode::$opName, shift.clone(), value.clone()))?;
                 }
             }
-        }
-    };
+        };
+
+
+    }};
 }
 
 macro_rules! handle_bin_c {
-    ($stack:expr, $op:expr, $opName:ident) => {
-        let a = pop_or_break!($stack);
-        let b = pop_or_break!($stack);
+    ($stack:expr, $op:expr, $opName:ident) => {{
+        let a = $stack.pop()?;
+        let b = $stack.pop()?;
 
         match_deref::match_deref! {
             match (&a, &b) {
@@ -960,65 +649,46 @@ macro_rules! handle_bin_c {
                     } else {
                         U256::ZERO
                     };
-
-                    // println!("{} {:?} {:?} -> {:?}", stringify!($opName), a, b, res);
-                    push_or_break!($stack, HeapRef::new(AbstractValue::Const(res)));
+                    $stack.push(HeapRef::new(AbstractValue::Const(res)))?;
                 }
                 (a, b) => {
-                    push_or_break!($stack, HeapRef::new(AbstractValue::BinOpResult(Opcode::$opName, a.clone(), b.clone())));
+
+                    $stack.push(AbstractValue::bin(Opcode::$opName, a.clone(), b.clone()))?;
                 }
             }
-        }
-    };
-}
-
-macro_rules! handle_dup {
-    ($stack:expr, $n:expr) => {
-        match $stack.dup($n) {
-            Err(_) => {
-                return StepResult::Stop;
-            }
-            Ok(_) => {}
-        }
-    };
-}
-
-macro_rules! handle_swap {
-    ($stack:expr, $n:expr) => {
-        match $stack.swap($n) {
-            Err(_) => {
-                return StepResult::Stop;
-            }
-            Ok(_) => {}
-        }
-    };
+        };
+    }};
 }
 
 enum StepResult {
     Ok,
     Stop,
+    JUMP,
     Split(usize),
 }
-struct AbstractVMInstance {
-    program_bytes: Rc<Vec<u8>>,
-    program: Rc<Vec<Operation>>,
+struct AbstractVMInstance<'a> {
+    program_bytes: &'a [u8],
+    program: &'a Vec<Operation<'a>>,
     pc: usize,
     jump_dests: Rc<HashMap<usize, usize>>,
-    stack: AbstractStack,
+    stack: abstract_stack::AbstractStack,
     memory: AbstractMemory,
-    storage: HashMap<U256, HeapRef<AbstractValue>>,
-    tmemory: HashMap<U256, HeapRef<AbstractValue>>,
+    storage: HashMap<U256, AbstractValueRef>,
+    tmemory: HashMap<U256, AbstractValueRef>,
     steps: usize,
 
+    last_push4: u32,
+    last_selector: u32,
+    last_selector_cmd: usize,
     return_data_size: usize,
 
     halted: bool,
 }
-impl AbstractVMInstance {
+impl<'a> AbstractVMInstance<'a> {
     fn copy(&self, pc: usize) -> Self {
         Self {
-            program_bytes: self.program_bytes.clone(),
-            program: self.program.clone(),
+            program_bytes: self.program_bytes,
+            program: self.program,
             jump_dests: self.jump_dests.clone(),
             pc,
             stack: self.stack.copy(),
@@ -1026,13 +696,16 @@ impl AbstractVMInstance {
             storage: self.storage.clone(),
             tmemory: self.tmemory.clone(),
             halted: self.halted,
+            last_selector: self.last_selector,
+            last_push4: self.last_push4,
             return_data_size: self.return_data_size,
             steps: self.steps,
+            last_selector_cmd: self.last_selector_cmd,
         }
     }
     fn new(
-        program_bytes: Rc<Vec<u8>>,
-        program: Rc<Vec<Operation>>,
+        program_bytes: &'a [u8],
+        program: &'a Vec<Operation>,
         jump_dests: Rc<HashMap<usize, usize>>,
         pc: usize,
     ) -> Self {
@@ -1041,120 +714,163 @@ impl AbstractVMInstance {
             program,
             pc,
             jump_dests,
-            stack: AbstractStack::new(),
+            stack: abstract_stack::AbstractStack::new(),
             memory: AbstractMemory::new(),
             storage: HashMap::new(),
             tmemory: HashMap::new(),
             steps: 0,
+            last_push4: 0,
+            last_selector: 0,
             return_data_size: 0,
             halted: false,
+            last_selector_cmd: 0,
         }
     }
 
-    pub fn step(&mut self, analysis: &mut Analysis) -> StepResult {
+    pub fn step(
+        &mut self,
+        analysis: &mut Analysis,
+        context: &AnalysisContext,
+    ) -> Result<StepResult, InstructionResult> {
         if self.halted {
-            return StepResult::Stop;
+            return Ok(StepResult::Stop);
         }
 
-        if self.steps > 300 {
-            self.halted = true;
-            return StepResult::Stop;
-        }
+        // if self.steps > MAX_STEPS {
+        //     // println!("MAX STEPS");
+        //     self.halted = true;
+        //     return Ok(StepResult::Stop);
+        // }
 
-        self.steps += 1;
-        let prog = self.program.clone();
-        let pc = self.pc;
-        let ins = prog.get(pc);
-        let ins = match ins {
-            None => {
-                return StepResult::Stop;
-            }
-            Some(v) => v,
-        };
+        let ins = self.program.get(self.pc);
+
         // println!("{:?}", ins);
-        let res = self.step_(ins, analysis);
+        let res = match ins {
+            None => return Ok(StepResult::Stop),
+            Some(v) => self.step_(v, analysis, context)?,
+        };
+        let top = self.stack.data.last();
+        if let Some(val) = top {
+            if let AbstractValue::Const(value) = &**val {
+                if is_address_like(value) {
+                    analysis
+                        .external_contracts
+                        .push(HeapRef::new(AbstractValue::AddressConst(Address::from(
+                            value.to::<U160>(),
+                        ))));
+                }
+            }
+        }
         match &res {
             StepResult::Stop => {
                 self.halted = true;
             }
             _ => {}
         }
-        res
+        self.steps += 1;
+        Ok(res)
     }
 
-    fn step_(&mut self, ins: &Operation, analysis: &mut Analysis) -> StepResult {
+    fn step_(
+        &mut self,
+        ins: &Operation,
+        analysis: &mut Analysis,
+        context: &AnalysisContext,
+    ) -> Result<StepResult, InstructionResult> {
         let stack = &mut self.stack;
         let memory = &mut self.memory;
-        let storage = &mut self.storage;
         let tmemory = &mut self.tmemory;
         let jump_dests = &self.jump_dests;
 
         match ins.opcode {
             Opcode::SELFDESTRUCT => {
-                pop_or_break!(stack);
-                return StepResult::Stop;
+                stack.drop_n(1)?;
+                return Ok(StepResult::Stop);
             }
             Opcode::STOP | Opcode::INVALID => {
-                return StepResult::Stop;
+                return Ok(StepResult::Stop);
             }
             Opcode::REVERT | Opcode::RETURN => {
-                pop_or_break!(stack);
-                pop_or_break!(stack);
-                return StepResult::Stop;
+                stack.drop_n(2)?;
+                return Ok(StepResult::Stop);
             }
             Opcode::JUMP => {
-                let byte_offset = pop_or_break!(stack);
+                let byte_offset = stack.pop()?;
+
                 match_deref::match_deref! {
                     match &byte_offset {
                         Deref @ AbstractValue::Const(v) => {
                             let offset: usize = v.to();
                             if let Some(new_pc) = jump_dests.get(&offset) {
                                 self.pc = *new_pc;
-                                return StepResult::Ok;
-                            } else {
-                                return StepResult::Stop;
+                                return Ok(StepResult::JUMP);
+                            }
+                        }
+                        _ => {}
+                    }
+                };
+
+                return Ok(StepResult::Stop);
+            }
+            Opcode::JUMPI => {
+                let byte_offset = stack.pop()?;
+                let cond = stack.pop()?;
+                match_deref::match_deref! {
+                    match (&cond, &byte_offset) {
+                        (Deref @ AbstractValue::Const(cond), Deref @ AbstractValue::Const(byte_offset)) => {
+                            let offset: usize = byte_offset.to();
+                            if let Some(new_pc) = jump_dests.get(&offset) {
+                                if cond.is_zero() {
+                                    self.pc += 1;
+                                } else {
+                                    self.pc = *new_pc;
+                                }
+                                return Ok(StepResult::Ok);
+                            }
+                        }
+                        _ => {}
+                    }
+                };
+
+                match_deref! {
+                    match &cond {
+                        Deref @ AbstractValue::TypeMask(SlotType::Bool, inner) => {
+                            if let Some(slot) = inner.slot() {
+                                analysis.promote(&slot, SlotType::Bool);
+                            };
+                        }
+                        _ => ()
+                    }
+                }
+
+                self.pc += 1;
+                match_deref::match_deref! {
+                    match &byte_offset {
+                        Deref @ AbstractValue::Const(byte_offset) => {
+                            let offset: usize = byte_offset.to();
+                            if let Some(new_pc) = jump_dests.get(&offset) {
+                                return Ok(StepResult::Split(*new_pc));
                             }
                         }
                         _ => {
-                            return StepResult::Stop;
                         }
                     }
                 };
-            }
-            Opcode::JUMPI => {
-                let byte_offset = pop_or_break!(stack);
-                let cond = pop_or_break!(stack);
-                match_deref::match_deref! {
-                    match (&cond, &byte_offset) {
-                        (_, Deref @ AbstractValue::Const(byte_offset)) => {
-                            let offset: usize = byte_offset.to();
-                            if let Some(new_pc) = jump_dests.get(&offset) {
-                                let split_pc = self.pc + 1;
-                                self.pc = *new_pc;
-                                return StepResult::Split(split_pc);
-                            } else {
-                                self.pc += 1;
-                            }
-                        }
-                        (a, b) => {
-                            self.pc += 1;
-                        }
-                    }
-                }
-                return StepResult::Ok;
+
+                return Ok(StepResult::Ok);
             }
             _ => {}
         };
         match ins.opcode {
             Opcode::STATICCALL | Opcode::DELEGATECALL => {
-                let gas = pop_or_break!(stack);
-                let address = pop_or_break!(stack);
+                let gas = stack.pop()?;
+                let address = stack.pop()?;
                 analysis.external_contracts.push(address.clone());
 
-                let args_offset = pop_or_break!(stack);
-                let args_size = pop_or_break!(stack);
-                let ret_offset = pop_or_break!(stack);
-                let ret_size = pop_or_break!(stack);
+                let args_offset = stack.pop()?;
+                let args_size = stack.pop()?;
+                let ret_offset = stack.pop()?;
+                let ret_size = stack.pop()?;
                 if let AbstractValue::Const(v) = *ret_size {
                     let size: usize = v.to();
                     self.return_data_size = size;
@@ -1167,19 +883,19 @@ impl AbstractVMInstance {
 
                 memory.mstore(ret_offset, res.clone());
 
-                push_or_break!(stack, res.clone())
+                stack.push(res.clone())?;
             }
             Opcode::CALL | Opcode::CALLCODE => {
-                let gas = pop_or_break!(stack);
-                let address = pop_or_break!(stack);
+                let gas = stack.pop()?;
+                let address = stack.pop()?;
 
                 analysis.external_contracts.push(address.clone());
 
-                let value = pop_or_break!(stack);
-                let args_offset = pop_or_break!(stack);
-                let args_size = pop_or_break!(stack);
-                let ret_offset = pop_or_break!(stack);
-                let ret_size = pop_or_break!(stack);
+                let value = stack.pop()?;
+                let args_offset = stack.pop()?;
+                let args_size = stack.pop()?;
+                let ret_offset = stack.pop()?;
+                let ret_size = stack.pop()?;
                 if let AbstractValue::Const(v) = *ret_size {
                     let size: usize = v.to();
                     self.return_data_size = size;
@@ -1191,137 +907,92 @@ impl AbstractVMInstance {
                     ins.opcode, gas, address, value, selector, args,
                 ));
                 memory.mstore(ret_offset, res.clone());
-                push_or_break!(stack, res);
+                stack.push(res)?;
             }
 
             Opcode::CREATE => {
-                let val = AbstractValue::CREATE(
-                    pop_or_break!(stack),
-                    pop_or_break!(stack),
-                    pop_or_break!(stack),
-                );
-                push_or_break_val!(stack, val)
+                stack.drop_n(3)?;
+                stack.push(AbstractValue::op(Opcode::CREATE))?
             }
 
             Opcode::CREATE2 => {
-                let val = AbstractValue::CREATE2(
-                    pop_or_break!(stack),
-                    pop_or_break!(stack),
-                    pop_or_break!(stack),
-                    pop_or_break!(stack),
-                );
-                push_or_break_val!(stack, val)
+                stack.drop_n(4)?;
+                stack.push(AbstractValue::op(Opcode::CREATE2))?
             }
 
-            Opcode::ADD => {
-                handle_bin!(stack, U256::wrapping_add, ADD);
-            }
-            Opcode::SUB => {
-                handle_bin!(stack, U256::wrapping_sub, SUB);
-            }
-            Opcode::MUL => {
-                handle_bin!(stack, U256::wrapping_mul, MUL);
-            }
+            Opcode::ADD => handle_bin!(stack, U256::wrapping_add, ADD),
+            Opcode::SUB => handle_bin!(stack, U256::wrapping_sub, SUB),
+            Opcode::MUL => handle_bin!(stack, U256::wrapping_mul, MUL),
             Opcode::DIV => {
-                let a = pop_or_break!(stack);
-                let b = pop_or_break!(stack);
-                match_deref::match_deref! {
-                    match (&a, &b) {
+                let value = match_deref::match_deref! {
+                    match (&stack.pop()?, &stack.pop()?) {
                         (Deref @ AbstractValue::Const(a), Deref @ AbstractValue::Const(b)) => {
                             if b.is_zero() {
-                                push_or_break!(stack, AbstractValue::val(&a));
+                                AbstractValue::val(&a)
                             } else {
-                                push_or_break!(stack, AbstractValue::val(&a.wrapping_div(*b)));
+                                AbstractValue::val(&a.wrapping_div(*b))
                             }
                         },
-                        _ => {
-                            push_or_break!(
-                                stack,
-                                AbstractValue::bin(Opcode::DIV, a.clone(), b.clone())
-                            )
-                        }
+                        (a, b) => AbstractValue::bin(Opcode::DIV, a.clone(), b.clone())
                     }
                 };
+                stack.push(value)?;
             }
             Opcode::AND => {
-                handle_bin_op!(stack, &, AND);
-
-                let top = if let Some(top) = stack.data.last() {
-                    top
-                } else {
-                    self.pc += 1;
-                    return StepResult::Ok;
-                };
+                handle_bin!(stack, &, AND);
                 match_deref! {
-                    match top {
-                        Deref@AbstractValue::AddressRef(Deref@AbstractValue::UnaryOpResult(Opcode::SLOAD, _)) => {
-                            analysis.external_contracts.push(top.clone());
+                    match stack.data.last() {
+                        Some(Deref@AbstractValue::TypeMask(t, any)) => {
+                            if t == &SlotType::Address {
+                                analysis.external_contracts.push(HeapRef::new(AbstractValue::TypeMask(*t, any.clone())));
+                            }
+                            if let Some(slot) = any.slot() {
+                                analysis.promote(&slot, *t);
+                            }
                         }
-                        Deref@AbstractValue::BinOpResult(Opcode::AND, Deref@AbstractValue::Const(_), Deref@AbstractValue::UnaryOpResult(Opcode::SLOAD, _)) => {
-                            // for (i, size) in SIZE_MASKS.iter().enumerate() {
-                            //     if mask.eq(size) {
-                            //         break;
-                            //     }
-                            // }
-                        }
-
                         _ => {}
                     }
                 }
             }
-            Opcode::SHL => {
-                handle_shift_op!(stack, U256::wrapping_shl, SHL);
-            }
-            Opcode::SHR => {
-                handle_shift_op!(stack, U256::wrapping_shr, SHR);
-            }
-            Opcode::MOD => {
-                handle_bin!(stack, U256::wrapping_rem, MOD);
-            }
+            Opcode::SHL => handle_shift_op!(stack, U256::wrapping_shl, SHL, U256::ZERO),
+            Opcode::SHR => handle_shift_op!(stack, U256::wrapping_shr, SHR, U256::MAX),
+            Opcode::MOD => handle_bin!(stack, U256::wrapping_rem, MOD),
             Opcode::SDIV => {
-                handle_bin!(stack, i256_div, SDIV);
+                handle_bin!(stack, revm::interpreter::instructions::i256::i256_div, SDIV)
             }
             Opcode::EQ => {
+                if self.last_push4 != 0
+                    && self.pc > self.last_selector_cmd
+                    && self.pc - self.last_selector_cmd < 8
+                {
+                    self.last_selector = self.last_push4;
+                    self.last_push4 = 0;
+                }
                 handle_bin_c!(stack, U256::eq, EQ);
             }
-            Opcode::LT => {
-                handle_bin_c!(stack, U256::lt, LT);
-            }
-            Opcode::GT => {
-                handle_bin_c!(stack, U256::gt, GT);
-            }
+            Opcode::LT => handle_bin_c!(stack, U256::lt, LT),
+            Opcode::GT => handle_bin_c!(stack, U256::gt, GT),
             Opcode::NOT => {
-                let v = pop_or_break!(stack);
-                let out = match_deref! {
+                let v = stack.pop()?;
+                stack.push(match_deref! {
                     match &v {
-                        Deref @ AbstractValue::Const(v) => {
-                            AbstractValue::Const(!v)
-                        }
-                        _ => AbstractValue::UnaryOpResult(Opcode::NOT, v)
+                        Deref @ AbstractValue::Const(v) => AbstractValue::val(&(!v)),
+                        _ => AbstractValue::unary(Opcode::NOT, v)
                     }
-                };
-                push_or_break_val!(stack, out)
+                })?;
             }
-            Opcode::ISZERO => {
-                handle_unary!(stack, ISZERO, U256::is_zero);
-            }
-            Opcode::POP => {
-                pop_or_break!(stack);
-            }
-            Opcode::OR => {
-                handle_bin_op!(stack, |, OR);
-            }
-            Opcode::XOR => {
-                handle_bin_op!(stack, ^, XOR);
-            }
+            Opcode::ISZERO => handle_unary!(stack, ISZERO, U256::is_zero),
+            Opcode::POP => stack.drop_n(1)?,
+            Opcode::OR => handle_bin!(stack, |, OR),
+            Opcode::XOR => handle_bin!(stack, ^, XOR),
             Opcode::SMOD => {
-                handle_bin!(stack, i256_mod, SMOD);
+                handle_bin!(stack, revm::interpreter::instructions::i256::i256_mod, SMOD)
             }
 
             Opcode::MULMOD | Opcode::ADDMOD => {
-                let a = pop_or_break!(stack);
-                let b = pop_or_break!(stack);
-                let c = pop_or_break!(stack);
+                let a = stack.pop()?;
+                let b = stack.pop()?;
+                let c = stack.pop()?;
                 match_deref::match_deref! {
                     match (&a, &b, &c) {
                         (
@@ -1330,85 +1001,73 @@ impl AbstractVMInstance {
                             Deref @ AbstractValue::Const(c),
                         ) => {
                             if ins.opcode == Opcode::MULMOD {
-                                push_or_break!(
-                                    stack,
+                                stack.push(
                                     HeapRef::new(AbstractValue::Const(U256::mul_mod(a.clone(), b.clone(), c.clone())))
-                                );
+                                )?;
                             } else {
-                                push_or_break!(
-                                    stack,
+                                stack.push(
                                     HeapRef::new(AbstractValue::Const(U256::add_mod(a.clone(), b.clone(), c.clone())))
-                                );
+                                )?;
                             }
                         }
                         _ => {
-                            push_or_break!(
-                                stack,
+                            stack.push(
                                 HeapRef::new(AbstractValue::TertiaryOpResult(ins.opcode, a, b, c))
-                            );
+                            )?;
                         }
                     }
                 }
             }
-            Opcode::EXP => {
-                handle_bin!(stack, U256::pow, EXP);
-            }
-            Opcode::SIGNEXTEND => {
-                let sign_extend = sign_extend;
-                handle_bin!(stack, sign_extend, SIGNEXTEND);
-            }
+            Opcode::EXP => handle_bin!(stack, U256::pow, EXP),
+            Opcode::SIGNEXTEND => handle_bin!(stack, crate::analysis::sign_extend, SIGNEXTEND),
             Opcode::SLT | Opcode::SGT => {
                 let order = if ins.opcode == Opcode::SLT {
                     std::cmp::Ordering::Less
                 } else {
                     std::cmp::Ordering::Greater
                 };
-                let a = pop_or_break!(stack);
-                let b = pop_or_break!(stack);
+                let a = stack.pop()?;
+                let b = stack.pop()?;
                 match_deref::match_deref! {
                     match (&a, &b) {
                         (Deref @ AbstractValue::Const(a), Deref @ AbstractValue::Const(b)) => {
-                            push_or_break!(
-                                stack,
+                            stack.push(
                                 HeapRef::new(AbstractValue::Const(U256::from(
                                     i256_cmp(a, b) == order
                                 )))
-                            );
+                            )?;
                         }
                         _ => {
-                            push_or_break!(
-                                stack,
-                                HeapRef::new(AbstractValue::BinOpResult(ins.opcode, a, b))
-                            )
+                            stack.push(
+                                AbstractValue::bin(ins.opcode, a, b)
+                            )?;
                         }
                     }
                 }
             }
             Opcode::BYTE => {
-                let i = pop_or_break!(stack);
-                let w = pop_or_break!(stack);
+                let i = stack.pop()?;
+                let w = stack.pop()?;
                 match_deref::match_deref! {
                     match (&w, &i) {
                         (Deref @ AbstractValue::Const(w), Deref @ AbstractValue::Const(i)) => {
                             let i: usize = i.to();
                             let b = w.byte(31 - i);
-                            push_or_break!(stack, HeapRef::new(AbstractValue::Const(U256::from(b))));
+                            stack.push(HeapRef::new(AbstractValue::Const(U256::from(b))))?;
                         }
                         _ => {
-                            push_or_break!(
-                                stack,
-                                HeapRef::new(AbstractValue::BinOpResult(Opcode::BYTE, w, i))
-                            );
+                            stack.push(
+                                AbstractValue::bin(Opcode::BYTE, w, i)
+                            )?;
                         }
                     }
                 }
             }
-            Opcode::SAR => {
-                handle_shift_op!(stack, U256::arithmetic_shr, SAR);
-            }
+            Opcode::SAR => handle_shift_op!(stack, U256::arithmetic_shr, SAR, U256::MAX),
             Opcode::SHA3 => {
-                let offset = pop_or_break!(stack);
-                let size = pop_or_break!(stack);
+                let offset = stack.pop()?;
+                let size = stack.pop()?;
+
                 let exact = match_deref::match_deref! {
                     match (&offset, &size) {
                         (Deref @ AbstractValue::Const(offset), Deref @ AbstractValue::Const(size)) => {
@@ -1418,10 +1077,10 @@ impl AbstractVMInstance {
                                 let offset: usize = offset.to();
                                 let size: usize = size.to();
                                 let out = if size == 32 {
-                                    memory.get_word(offset).map(|v|HeapRef::new(AbstractValue::UnaryOpResult(Opcode::SHA3, v)))
+                                    memory.get_word(offset).map(|v|AbstractValue::unary(Opcode::SHA3, v))
                                 } else if size == 64 {
                                     if let (Some(v0), Some(v1)) = (memory.get_word(offset), memory.get_word(offset+32)) {
-                                        Some(HeapRef::new(AbstractValue::BinOpResult(Opcode::SHA3, v0, v1)))
+                                        Some(AbstractValue::bin(Opcode::SHA3, v0, v1))
                                     } else {
                                         None
                                     }
@@ -1444,179 +1103,127 @@ impl AbstractVMInstance {
                 };
 
                 if let Some(v) = exact {
-                    push_or_break!(stack, v);
+                    stack.push(v)?;
                 } else {
                     let value = memory.load(offset.clone());
                     match value {
                         Some(v) => {
-                            push_or_break!(
-                                stack,
-                                HeapRef::new(AbstractValue::UnaryOpResult(Opcode::SHA3, v))
-                            );
+                            stack.push(AbstractValue::unary(Opcode::SHA3, v))?;
                         }
                         None => {
-                            push_or_break!(
-                                stack,
-                                HeapRef::new(AbstractValue::BinOpResult(
-                                    Opcode::SHA3,
-                                    offset,
-                                    size
-                                ))
-                            );
+                            stack.push(AbstractValue::bin(Opcode::SHA3, offset, size))?;
                         }
                     }
                 }
             }
             Opcode::CALLDATALOAD => {
-                let offset = pop_or_break!(stack);
+                let offset = stack.pop()?;
                 match_deref::match_deref! {
                     match &offset {
-                        Deref @ AbstractValue::Const(offset) => {
-                            push_or_break_val!(stack, AbstractValue::Calldata(offset.to()));
+                        Deref @ AbstractValue::Const(v) => {
+                            if v.lt(&U256::from(10000)) {
+                                let offset: usize = v.to();
+                                let arg_index = if offset > 4 {
+                                    (offset - 4) / 32
+                                } else {
+                                    0
+                                };
+                                stack.push(HeapRef::new(AbstractValue::Calldata(arg_index)))?;
+                            } else {
+                                stack.push(AbstractValue::unary(Opcode::CALLDATALOAD, offset))?
+                            }
                         }
                         _ => {
-                            push_or_break_val!(
-                                stack,
-                                AbstractValue::UnaryOpResult(Opcode::CALLDATALOAD, offset)
-                            )
+                            stack.push(AbstractValue::unary(Opcode::CALLDATALOAD, offset))?
                         }
-                    }
-                }
-            }
-            Opcode::CODESIZE => {
-                push_or_break_val!(stack, AbstractValue::Const(U256::from(self.program.len())))
-            }
-            Opcode::BALANCE | Opcode::EXTCODESIZE | Opcode::EXTCODEHASH => {
-                let address = pop_or_break!(stack);
-                analysis.external_contracts.push(address.clone());
-                push_or_break_val!(stack, AbstractValue::UnaryOpResult(ins.opcode, address))
-            }
-            Opcode::EXTCODECOPY => {
-                let address = pop_or_break!(stack);
-                analysis.external_contracts.push(address.clone());
-                pop_or_break!(stack);
-                let offset = pop_or_break!(stack);
-                pop_or_break!(stack);
-                memory.mstore(
-                    offset,
-                    HeapRef::new(AbstractValue::OpcodeResult(Opcode::EXTCODECOPY)),
-                );
-            }
-            Opcode::RETURNDATACOPY | Opcode::CALLDATACOPY | Opcode::CODECOPY => {
-                pop_or_break!(stack);
-                let offset = pop_or_break!(stack);
-                pop_or_break!(stack);
-                memory.mstore(
-                    offset,
-                    HeapRef::new(AbstractValue::OpcodeResult(ins.opcode)),
-                );
-            }
-            Opcode::BLOBHASH => {
-                pop_or_break!(stack);
-                push_or_break_val!(stack, AbstractValue::OpcodeResult(Opcode::BLOBHASH));
-            }
-            Opcode::BLOBBASEFEE => {
-                push_or_break_val!(stack, AbstractValue::OpcodeResult(Opcode::BLOBBASEFEE));
-            }
-            Opcode::BLOCKHASH => {
-                let block_number = pop_or_break!(stack);
-                push_or_break_val!(
-                    stack,
-                    AbstractValue::UnaryOpResult(Opcode::BLOCKHASH, block_number)
-                );
-            }
-            Opcode::RETURNDATASIZE => {
-                stack.push_uint(self.return_data_size as u64).unwrap();
-            }
-            Opcode::CHAINID => {
-                stack.push_uint(1).unwrap();
-            }
-            Opcode::GAS
-            | Opcode::CALLVALUE
-            | Opcode::CALLDATASIZE
-            | Opcode::GASPRICE
-            | Opcode::BASEFEE
-            | Opcode::ADDRESS
-            | Opcode::ORIGIN
-            | Opcode::CALLER
-            | Opcode::COINBASE
-            | Opcode::DIFFICULTY
-            | Opcode::GASLIMIT
-            | Opcode::SELFBALANCE
-            | Opcode::NUMBER => {
-                push_or_break_val!(stack, AbstractValue::OpcodeResult(ins.opcode))
-            }
-            Opcode::TIMESTAMP => {
-                let timestamp_in_seconds = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                push_or_break_val!(
-                    stack,
-                    AbstractValue::Const(U256::from(timestamp_in_seconds))
-                );
-            }
-            Opcode::MLOAD => {
-                let offset = pop_or_break!(stack);
-                match memory.load(offset.clone()) {
-                    Some(v) => {
-                        // println!("MLOAD({:?}) = {:?}", offset, v);
-                        push_or_break!(stack, v)
-                    }
-                    None => {
-                        let res = AbstractValue::UnaryOpResult(Opcode::MLOAD, offset.clone());
-                        // println!("Opcode::MLOAD({:?}) = {:?}", offset, res);
-                        push_or_break_val!(stack, res)
-                    }
-                }
-            }
-            Opcode::MSTORE => {
-                let (offset, value) = (pop_or_break!(stack), pop_or_break!(stack));
-                // println!("MSTORE({:?}, {:?})", offset, value);
-                memory.mstore(offset, value);
-            }
-            Opcode::MSTORE8 => {
-                memory.mstore8(pop_or_break!(stack), pop_or_break!(stack));
-            }
-            Opcode::SLOAD => {
-                let offset = pop_or_break!(stack);
-                analysis
-                    .storage_slots
-                    .push(AbstractValue::unary(Opcode::SLOAD, offset.clone()));
-                let storage_value = match_deref::match_deref! {
-                    match &offset {
-                        Deref @ AbstractValue::Const(index) => {
-                            let out = match storage.get(&index) {
-                                None => Rc::new(AbstractValue::UnaryOpResult(Opcode::SLOAD, offset)),
-                                Some(v) => v.clone(),
-                            };
-                            out
-                        }
-                        _ => Rc::new(AbstractValue::UnaryOpResult(Opcode::SLOAD, offset))
                     }
                 };
+            }
+            Opcode::CODESIZE => stack.push(AbstractValue::val(&U256::from(self.program.len())))?,
+            Opcode::BALANCE | Opcode::EXTCODESIZE | Opcode::EXTCODEHASH => {
+                let address = stack.pop()?;
+                analysis.external_contracts.push(address.clone());
+                stack.push(AbstractValue::op(ins.opcode))?
+            }
+            Opcode::EXTCODECOPY => {
+                let address = stack.pop()?;
+                analysis.external_contracts.push(address.clone());
+                stack.pop()?;
+                let offset = stack.pop()?;
+                stack.pop()?;
+                memory.mstore(offset, AbstractValue::op(Opcode::EXTCODECOPY));
+            }
+            Opcode::RETURNDATACOPY | Opcode::CALLDATACOPY | Opcode::CODECOPY => {
+                stack.drop_n(1)?;
+                let offset = stack.pop()?;
+                stack.drop_n(1)?;
+                memory.mstore(offset, AbstractValue::op(ins.opcode));
+            }
+            Opcode::BLOBHASH => {
+                stack.drop_n(1)?;
+                stack.push(AbstractValue::op(Opcode::BLOBHASH))?
+            }
+            Opcode::BLOCKHASH => {
+                let val = stack.pop()?;
+                stack.push(AbstractValue::unary(Opcode::BLOCKHASH, val))?;
+            }
 
-                push_or_break!(stack, storage_value);
+            Opcode::RETURNDATASIZE => stack.push_uint(self.return_data_size as u64)?,
+
+            // All of these could technically be context dependent..
+            Opcode::ORIGIN
+            | Opcode::GAS
+            | Opcode::CALLVALUE
+            | Opcode::CALLER
+            | Opcode::ADDRESS
+            | Opcode::CALLDATASIZE
+            | Opcode::BLOBBASEFEE
+            | Opcode::DIFFICULTY
+            | Opcode::SELFBALANCE => stack.push(AbstractValue::op(ins.opcode))?,
+            Opcode::TIMESTAMP => stack.push(AbstractValue::val(&context.timestamp))?,
+            Opcode::NUMBER => stack.push(AbstractValue::val(&context.block_number))?,
+            Opcode::COINBASE => stack.push(AbstractValue::val(&context.coinbase))?,
+            Opcode::CHAINID => stack.push(AbstractValue::val(&context.chain_id))?,
+            Opcode::BASEFEE => stack.push(AbstractValue::val(&context.base_fee))?,
+            Opcode::GASPRICE => stack.push(AbstractValue::val(&context.gas_price))?,
+            // Opcode::ADDRESS => stack.push(AbstractValue::val(&context.contract_address))?,
+            Opcode::GASLIMIT => stack.push(AbstractValue::val(&context.block_gas_limit))?,
+
+            Opcode::MLOAD => {
+                let offset = &stack.pop()?;
+                match memory.load(offset.clone()) {
+                    Some(v) => stack.push(v)?,
+                    None => stack.push(AbstractValue::unary(Opcode::MLOAD, offset.clone()))?,
+                };
+            }
+            Opcode::MSTORE => memory.mstore(stack.pop()?, stack.pop()?),
+            Opcode::MSTORE8 => memory.mstore8(stack.pop()?, stack.pop()?),
+            Opcode::SLOAD => {
+                let sload_offset = AbstractValue::unary(Opcode::SLOAD, stack.pop()?);
+                let args = sload_offset.arg_source(self.last_selector);
+                // println!("SLOAD: {:?}", sload_offset);
+                let reduced = reduce(&sload_offset, &args);
+                stack.push(reduced.clone())?;
+
+                if let Some(slot) = convert(&reduced, &args, self.last_selector) {
+                    analysis.storage_slots.push(slot);
+                }
             }
             Opcode::SSTORE => {
-                let offset = pop_or_break!(stack);
-                analysis
-                    .storage_slots
-                    .push(AbstractValue::unary(Opcode::SLOAD, offset.clone()));
-                pop_or_break!(stack);
+                let sstore_offset = AbstractValue::unary(Opcode::SLOAD, stack.pop()?);
+                let args = sstore_offset.arg_source(self.last_selector);
+                let reduced = reduce(&sstore_offset, &args);
+                stack.pop()?;
+
+                if let Some(slot) = convert(&reduced, &args, self.last_selector) {
+                    analysis.storage_slots.push(slot);
+                }
             }
-            Opcode::PC => {
-                push_or_break_val!(stack, AbstractValue::Const(U256::from(ins.offset)));
-            }
-            Opcode::MSIZE => {
-                push_or_break_val!(stack, AbstractValue::Const(U256::from(memory.len())));
-            }
+            Opcode::PC => stack.push(AbstractValue::val(&U256::from(ins.offset)))?,
+            Opcode::MSIZE => stack.push(AbstractValue::val(&U256::from(memory.len())))?,
             Opcode::MCOPY => {
-                let dest = pop_or_break!(stack);
-                let offset = pop_or_break!(stack);
-                let size = pop_or_break!(stack);
                 match_deref::match_deref! {
-                    match (&dest, &offset, &size) {
+                    match (&stack.pop()?, &stack.pop()?, &stack.pop()?) {
                         (
                             Deref @ AbstractValue::Const(dest),
                             Deref @ AbstractValue::Const(offset),
@@ -1635,7 +1242,7 @@ impl AbstractVMInstance {
                 }
             }
             Opcode::TLOAD => {
-                let offset_v = pop_or_break!(stack);
+                let offset_v = stack.pop()?;
 
                 let res = match_deref::match_deref! {
                     match &offset_v {
@@ -1652,11 +1259,11 @@ impl AbstractVMInstance {
                         )),
                     }
                 };
-                push_or_break!(stack, res);
+                stack.push(res)?;
             }
             Opcode::TSTORE => {
-                let offset = pop_or_break!(stack);
-                let value = pop_or_break!(stack);
+                let offset = stack.pop()?;
+                let value = stack.pop()?;
                 match_deref::match_deref! {
                     match &offset {
                         Deref @ AbstractValue::Const(offset) => {
@@ -1666,161 +1273,98 @@ impl AbstractVMInstance {
                     }
                 };
             }
-            Opcode::PUSH0 => {
-                push_or_break_val!(stack, AbstractValue::Const(U256::ZERO))
+            Opcode::DUP1 => stack.dup(1)?,
+            Opcode::DUP2 => stack.dup(2)?,
+            Opcode::DUP3 => stack.dup(3)?,
+            Opcode::DUP4 => stack.dup(4)?,
+            Opcode::DUP5 => stack.dup(5)?,
+            Opcode::DUP6 => stack.dup(6)?,
+            Opcode::DUP7 => stack.dup(7)?,
+            Opcode::DUP8 => stack.dup(8)?,
+            Opcode::DUP9 => stack.dup(9)?,
+            Opcode::DUP10 => stack.dup(10)?,
+            Opcode::DUP11 => stack.dup(11)?,
+            Opcode::DUP12 => stack.dup(12)?,
+            Opcode::DUP13 => stack.dup(13)?,
+            Opcode::DUP14 => stack.dup(14)?,
+            Opcode::DUP15 => stack.dup(15)?,
+            Opcode::DUP16 => stack.dup(16)?,
+            Opcode::LOG0 => stack.drop_n(2)?,
+            Opcode::LOG1 => stack.drop_n(3)?,
+            Opcode::LOG2 => stack.drop_n(4)?,
+            Opcode::LOG3 => stack.drop_n(5)?,
+            Opcode::LOG4 => stack.drop_n(6)?,
+            Opcode::SWAP1 => stack.swap(1)?,
+            Opcode::SWAP2 => stack.swap(2)?,
+            Opcode::SWAP3 => stack.swap(3)?,
+            Opcode::SWAP4 => stack.swap(4)?,
+            Opcode::SWAP5 => stack.swap(5)?,
+            Opcode::SWAP6 => stack.swap(6)?,
+            Opcode::SWAP7 => stack.swap(7)?,
+            Opcode::SWAP8 => stack.swap(8)?,
+            Opcode::SWAP9 => stack.swap(9)?,
+            Opcode::SWAP10 => stack.swap(10)?,
+            Opcode::SWAP11 => stack.swap(11)?,
+            Opcode::SWAP12 => stack.swap(12)?,
+            Opcode::SWAP13 => stack.swap(13)?,
+            Opcode::SWAP14 => stack.swap(14)?,
+            Opcode::SWAP15 => stack.swap(15)?,
+            Opcode::SWAP16 => stack.swap(16)?,
+            Opcode::PUSH0 => stack.push(AbstractValue::val(&U256::ZERO))?,
+            Opcode::PUSH1 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH2 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH3 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH4 => {
+                self.last_push4 =
+                    u32::from_be_bytes([ins.input[3], ins.input[2], ins.input[1], ins.input[0]]);
+                self.last_selector_cmd = self.pc;
+                stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?
             }
-            Opcode::DUP1 => {
-                handle_dup!(stack, 1);
-            }
-            Opcode::DUP2 => {
-                handle_dup!(stack, 2);
-            }
-            Opcode::DUP3 => {
-                handle_dup!(stack, 3);
-            }
-            Opcode::DUP4 => {
-                handle_dup!(stack, 4);
-            }
-            Opcode::DUP5 => {
-                handle_dup!(stack, 5);
-            }
-            Opcode::DUP6 => {
-                handle_dup!(stack, 6);
-            }
-            Opcode::DUP7 => {
-                handle_dup!(stack, 7);
-            }
-            Opcode::DUP8 => {
-                handle_dup!(stack, 8);
-            }
-            Opcode::DUP9 => {
-                handle_dup!(stack, 9);
-            }
-            Opcode::DUP10 => {
-                handle_dup!(stack, 10);
-            }
-            Opcode::DUP11 => {
-                handle_dup!(stack, 11);
-            }
-            Opcode::DUP12 => {
-                handle_dup!(stack, 12);
-            }
-            Opcode::DUP13 => {
-                handle_dup!(stack, 13);
-            }
-            Opcode::DUP14 => {
-                handle_dup!(stack, 14);
-            }
-            Opcode::DUP15 => {
-                handle_dup!(stack, 15);
-            }
-            Opcode::DUP16 => {
-                handle_dup!(stack, 16);
-            }
-
-            Opcode::LOG0 => {
-                pop_or_break!(stack);
-                pop_or_break!(stack);
-            }
-            Opcode::LOG1 => {
-                pop_or_break!(stack);
-                pop_or_break!(stack);
-
-                pop_or_break!(stack);
-            }
-            Opcode::LOG2 => {
-                pop_or_break!(stack);
-                pop_or_break!(stack);
-
-                pop_or_break!(stack);
-                pop_or_break!(stack);
-            }
-            Opcode::LOG3 => {
-                pop_or_break!(stack);
-                pop_or_break!(stack);
-
-                pop_or_break!(stack);
-                pop_or_break!(stack);
-                pop_or_break!(stack);
-            }
-            Opcode::LOG4 => {
-                pop_or_break!(stack);
-                pop_or_break!(stack);
-
-                pop_or_break!(stack);
-                pop_or_break!(stack);
-                pop_or_break!(stack);
-                pop_or_break!(stack);
-            }
-            Opcode::SWAP1 => {
-                handle_swap!(stack, 1);
-            }
-            Opcode::SWAP2 => {
-                handle_swap!(stack, 2);
-            }
-            Opcode::SWAP3 => {
-                handle_swap!(stack, 3);
-            }
-            Opcode::SWAP4 => {
-                handle_swap!(stack, 4);
-            }
-            Opcode::SWAP5 => {
-                handle_swap!(stack, 5);
-            }
-            Opcode::SWAP6 => {
-                handle_swap!(stack, 6);
-            }
-            Opcode::SWAP7 => {
-                handle_swap!(stack, 7);
-            }
-            Opcode::SWAP8 => {
-                handle_swap!(stack, 8);
-            }
-            Opcode::SWAP9 => {
-                handle_swap!(stack, 9);
-            }
-            Opcode::SWAP10 => {
-                handle_swap!(stack, 10);
-            }
-            Opcode::SWAP11 => {
-                handle_swap!(stack, 11);
-            }
-            Opcode::SWAP12 => {
-                handle_swap!(stack, 12);
-            }
-            Opcode::SWAP13 => {
-                handle_swap!(stack, 13);
-            }
-            Opcode::SWAP14 => {
-                handle_swap!(stack, 14);
-            }
-            Opcode::SWAP15 => {
-                handle_swap!(stack, 15);
-            }
-            Opcode::SWAP16 => {
-                handle_swap!(stack, 16);
-            }
+            Opcode::PUSH5 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH6 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH7 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH8 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH9 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH10 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH11 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH12 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH13 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH14 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH15 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH16 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH17 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH18 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH19 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH20 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH21 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH22 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH23 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH24 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH25 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH26 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH27 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH28 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH29 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH30 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH31 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
+            Opcode::PUSH32 => stack.push(AbstractValue::val(&U256::from_be_slice(ins.input)))?,
             Opcode::JUMPDEST => {}
             op => {
-                if is_push(op) {
-                    let v = U256::from_be_slice(ins.input.as_slice());
-                    push_or_break_val!(stack, AbstractValue::Const(v));
-                } else {
-                    panic!("Abstract opcode not implemented {:?}", op);
-                }
+                panic!("Abstract opcode not implemented {:?}", op);
             }
-        }
+        };
         self.pc += 1;
 
-        return StepResult::Ok;
+        return Ok(StepResult::Ok);
     }
 }
 
 struct Analysis {
-    storage_slots: Vec<AbstractValueRef>,
+    storage_slots: Vec<AnalyzedStoragesSlot>,
     external_contracts: Vec<AbstractValueRef>,
-    slot_mask_size: HashMap<U256, usize>,
+    slot_mask_size: HashMap<U256, SlotType>,
 }
+
 impl Analysis {
     fn new() -> Self {
         Self {
@@ -1829,35 +1373,42 @@ impl Analysis {
             slot_mask_size: HashMap::new(),
         }
     }
+
+    fn promote(&mut self, slot: &U256, typ: SlotType) {
+        match self.slot_mask_size.entry(*slot) {
+            Entry::Occupied(mut entry) => {
+                entry.insert(entry.get().promote(&typ));
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(typ);
+            }
+        }
+    }
 }
-struct AbstractVM {
+struct AbstractVM<'a> {
     analysis: Analysis,
-    stack: Vec<AbstractVMInstance>,
+    stack: Vec<AbstractVMInstance<'a>>,
+    jump_dests: Rc<HashMap<usize, usize>>,
 }
 
-impl AbstractVM {
+impl<'a> AbstractVM<'a> {
     fn new(
-        program_bytes: Rc<Vec<u8>>,
-        program: Rc<Vec<Operation>>,
+        program_bytes: &'a [u8],
+        program: &'a Vec<Operation>,
         jump_dests: Rc<HashMap<usize, usize>>,
         start: usize,
     ) -> Self {
-        let current = AbstractVMInstance::new(
-            program_bytes.clone(),
-            program.clone(),
-            jump_dests.clone(),
-            start,
-        );
+        let current = AbstractVMInstance::new(program_bytes, program, jump_dests.clone(), start);
 
         Self {
             analysis: Analysis::new(),
             stack: vec![current],
+            jump_dests,
         }
     }
 
-    pub fn run(&mut self) {
-        let mut visited = HashSet::new();
-        visited.insert(self.stack.last().unwrap().pc);
+    pub fn run(&mut self, context: &AnalysisContext) {
+        let mut splits: HashMap<usize, usize> = HashMap::new();
 
         loop {
             let mut vm = match self.stack.pop() {
@@ -1873,18 +1424,29 @@ impl AbstractVM {
             };
 
             loop {
-                let res = vm.step(self.analysis.borrow_mut());
-
-                match res {
-                    StepResult::Stop => {
+                let res = match vm.step(self.analysis.borrow_mut(), context) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::debug!(target: LOGGER_TARGET_MAIN, "Failed to analyze program: {:?}", e);
                         break;
                     }
-                    StepResult::Split(pc) => {
-                        if visited.contains(&pc) {
-                            continue;
+                };
+
+                match res {
+                    StepResult::Stop => break,
+                    StepResult::JUMP => {
+                        let current = splits.entry(vm.pc).or_insert(1);
+                        if *current >= MAX_REVISITS {
+                            break;
                         }
-                        visited.insert(pc);
-                        self.stack.push(vm.copy(pc))
+                        *current += 1;
+                    }
+                    StepResult::Split(pc) => {
+                        let current = splits.entry(pc).or_insert(1);
+                        if *current <= MAX_REVISITS {
+                            self.stack.push(vm.copy(pc));
+                        }
+                        *current += 1;
                     }
                     _ => {}
                 }
@@ -1893,7 +1455,7 @@ impl AbstractVM {
     }
 }
 
-fn convert_to_address(v: &HeapRef<AbstractValue>) -> Option<Address> {
+fn convert_to_address(v: &AbstractValueRef) -> Option<Address> {
     match &**v {
         AbstractValue::AddressConst(v) => Some(v.clone()),
         AbstractValue::CallResult {
@@ -1912,16 +1474,16 @@ fn convert_to_address(v: &HeapRef<AbstractValue>) -> Option<Address> {
 
 pub fn perform_analysis(
     bytecode: &Bytecode,
-    do_abstract_analysis: bool,
+    context: &AnalysisContext,
 ) -> eyre::Result<(Vec<AnalyzedStoragesSlot>, Vec<Address>)> {
     let start = std::time::Instant::now();
 
-    let bytes: Vec<u8> = bytecode.bytes().to_vec();
-    let contract_instructions = disassemble_bytes(bytes.clone());
+    let bytes = &bytecode.bytes()[..];
+    let contract_instructions = disassemble_bytes(bytes);
 
     let add_slot = move |v: &mut Vec<AnalyzedStoragesSlot>, slot: &[u8]| {
         let slot = U256::from_be_slice(slot);
-        v.push(AnalyzedStoragesSlot::Slot(slot, SlotType::Uint));
+        v.push(AnalyzedStoragesSlot::Slot(slot, SlotType::Unknown));
     };
 
     if contract_instructions.len() <= 3 {
@@ -1934,117 +1496,105 @@ pub fn perform_analysis(
 
     for i in 0..contract_instructions.len() {
         let ins0 = &contract_instructions[i];
+        if i < contract_instructions.len() - 3 {
+            let ins1 = &contract_instructions[i + 1];
+            let ins2 = &contract_instructions[i + 2];
+            if ins1.opcode == Opcode::PUSH0 {
+                match ins2.opcode {
+                    Opcode::SSTORE | Opcode::SLOAD => {
+                        slots.push(AnalyzedStoragesSlot::Slot(U256::ZERO, SlotType::Unknown));
+                    }
+                    _ => {}
+                }
+            } else if ins1.opcode.is_push() {
+                match ins2.opcode {
+                    Opcode::SSTORE | Opcode::SLOAD => {
+                        add_slot(&mut slots, ins1.input);
+                    }
+                    _ => {}
+                }
+            } else if ins0.opcode.is_push() && ins1.opcode == Opcode::DUP1 {
+                match ins2.opcode {
+                    Opcode::SSTORE | Opcode::SLOAD => {
+                        add_slot(&mut slots, ins0.input);
+                    }
+                    _ => {}
+                }
+            }
+        }
         if ins0.opcode == Opcode::JUMPDEST {
             jump_dests.insert(ins0.offset as usize, i);
         }
     }
-    for i in 0..contract_instructions.len() - 3 {
-        let ins0 = &contract_instructions[i];
-        let ins1 = &contract_instructions[i + 1];
-        let ins2 = &contract_instructions[i + 2];
 
-        if ins1.opcode == Opcode::PUSH0 {
-            match ins2.opcode {
-                Opcode::SSTORE | Opcode::SLOAD => {
-                    slots.push(AnalyzedStoragesSlot::Slot(U256::ZERO, SlotType::Uint));
-                }
-                _ => {}
-            }
+    let (external_refs, storage_slots, type_masks) = {
+        let program = contract_instructions;
+        let program_bytes = bytes;
+        let jump_dests = Rc::new(jump_dests);
+        let mut vm = AbstractVM::new(program_bytes, &program, jump_dests.clone(), 0);
+        vm.run(&context);
+
+        (
+            vm.analysis.external_contracts,
+            vm.analysis.storage_slots,
+            vm.analysis.slot_mask_size,
+        )
+    };
+
+    let external_refs = external_refs
+        .into_iter()
+        .map(|v| reduce_externals(&v))
+        .collect::<Vec<_>>();
+
+    let contract_refs = external_refs
+        .iter()
+        .map(|v| convert_to_address(v))
+        .flatten()
+        .unique()
+        .collect::<Vec<_>>();
+
+    let cont_refs = external_refs
+        .into_iter()
+        .map(|v| convert(&v, &vec![], 0))
+        .flatten()
+        .unique()
+        .collect::<Vec<AnalyzedStoragesSlot>>();
+    let mut result: HashMap<U256, AnalyzedStoragesSlot> = HashMap::new();
+    for slot in slots
+        .iter()
+        .chain(storage_slots.iter())
+        .chain(cont_refs.iter())
+    {
+        let mut slot = slot.clone();
+        let slot_index = slot.get_slot();
+        let mask_type = type_masks.get(&slot_index);
+        if let Some(mask_type) = mask_type {
+            slot = slot.promote_type(mask_type);
         }
-        if is_push(ins1.opcode) {
-            match ins2.opcode {
-                Opcode::SSTORE | Opcode::SLOAD => {
-                    add_slot(&mut slots, ins1.input.as_slice());
-                }
-                _ => {}
+
+        match result.entry(slot_index) {
+            Entry::Occupied(mut entry) => {
+                entry.insert(entry.get().promote(&slot));
             }
-        }
-        if is_push(ins0.opcode) && ins1.opcode == Opcode::DUP1 {
-            match ins2.opcode {
-                Opcode::SSTORE | Opcode::SLOAD => {
-                    add_slot(&mut slots, ins0.input.as_slice());
-                }
-                _ => {}
+            Entry::Vacant(entry) => {
+                entry.insert(slot.clone());
             }
         }
     }
-
-    let result = if do_abstract_analysis {
-        let (external_refs, storage_slots) = {
-            let program = Rc::new(contract_instructions);
-            let program_bytes = Rc::new(bytes);
-            let jump_dests = Rc::new(jump_dests);
-            let mut vm = AbstractVM::new(
-                program_bytes.clone(),
-                program.clone(),
-                jump_dests.clone(),
-                0,
-            );
-            vm.run();
-
-            (vm.analysis.external_contracts, vm.analysis.storage_slots)
-        };
-
-        let storage_slots = storage_slots
-            .into_iter()
-            .map(|v| reduce(&v))
-            .collect::<Vec<_>>();
-
-        let external_refs = external_refs
-            .into_iter()
-            .map(|v| reduce_externals(&v))
-            .collect::<Vec<_>>();
-
-        let contract_refs = external_refs
-            .iter()
-            .map(|v| convert_to_address(v))
-            .flatten()
-            .unique()
-            .collect::<Vec<_>>();
-
-        let out_slots = storage_slots
-            .into_iter()
-            .map(|v| convert(&v))
-            .flatten()
-            .unique()
-            .collect::<Vec<AnalyzedStoragesSlot>>();
-
-        let cont_refs = external_refs
-            .into_iter()
-            .map(|v| convert(&v))
-            .flatten()
-            .unique()
-            .collect::<Vec<AnalyzedStoragesSlot>>();
-        let mut result: HashMap<U256, AnalyzedStoragesSlot> = HashMap::new();
-        for slot in slots.iter().chain(out_slots.iter()).chain(cont_refs.iter()) {
-            match result.entry(slot.get_slot()) {
-                Entry::Occupied(mut entry) => {
-                    entry.insert(entry.get().promote(slot));
-                }
-                Entry::Vacant(entry) => {
-                    entry.insert(slot.clone());
-                }
-            }
-        }
-        let out_slots = result
-            .into_values()
-            .sorted_by_key(|v| v.get_slot())
-            .collect::<Vec<_>>();
-
-        (out_slots, contract_refs)
-    } else {
-        (slots, vec![])
-    };
+    let out_slots = result
+        .into_values()
+        .sorted_by_key(|v| v.get_slot())
+        .collect::<Vec<_>>();
 
     log::debug!(target: LOGGER_TARGET_MAIN, "analysis took {:?}", start.elapsed());
-    return Ok(result);
+    return Ok((out_slots, contract_refs));
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy::hex;
+    use alloy::{eips::BlockId, hex};
     use alloy_provider::Provider;
-    use revm::primitives::Bytecode;
+    use revm::primitives::{Bytecode, TxKind};
 
     use crate::utils::provider_from_string;
 
@@ -2052,12 +1602,19 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn it_works() {
+        pretty_env_logger::init();
         // let test_addr = Address::from(hex!("bf1c0206de440b2cf76ea4405e1dbf2fc227a463"));
-        let test_addr = Address::from(hex!("784955641292b0014bc9ef82321300f0b6c7e36d"));
+        // let test_addr = Address::from(hex!("784955641292b0014bc9ef82321300f0b6c7e36d"));
         // let test_addr = Address::from(hex!("ac3E018457B222d93114458476f3E3416Abbe38F"));
 
         // let test_addr = Address::from(hex!("7effd7b47bfd17e52fb7559d3f924201b9dbff3d"));
+        // let test_addr = Address::from(hex!("43506849d7c04f9138d1a2050bbf3a0c054402dd"));
         // let test_addr = Address::from(hex!("BBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb"));
+        // let test_addr = Address::from(hex!("2F50D538606Fa9EDD2B11E2446BEb18C9D5846bB"));
+        let test_addr = Address::from(hex!("DbC0cE2321B76D3956412B36e9c0FA9B0fD176E7"));
+        // let test_addr = Address::from(hex!("0aDc69041a2B086f8772aCcE2A754f410F211bed"));
+
+        // let test_addr = Address::from(hex!("4da27a545c0c5B758a6BA100e3a049001de870f5"));
         // let test_addr: Address = Address::from(hex!("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"));
         let url = std::env::var_os("PROVIDER").unwrap();
         let provider = provider_from_string(&url.to_string_lossy().to_string())
@@ -2066,7 +1623,20 @@ mod tests {
 
         let code = Bytecode::new_raw(provider.get_code_at(test_addr).await.unwrap());
 
-        match perform_analysis(&code, true) {
+        let block = provider
+            .get_block(
+                BlockId::latest(),
+                alloy::rpc::types::BlockTransactionsKind::Hashes,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let context = AnalysisContext::from(&block)
+            .with_contract_address(test_addr)
+            .with_chain_id(U256::from(1));
+
+        match perform_analysis(&code, &context) {
             Ok(data) => {
                 println!("Analyzed");
                 println!("Slots: {}", data.0.iter().join("\n"));

@@ -32,19 +32,23 @@ use std::ops::DerefMut;
 use std::{str::FromStr, sync::Arc};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
-
+mod analysis;
+mod abstract_value;
+mod abstract_stack;
+mod opcodes;
 pub mod utils;
 pub mod cannonical;
-pub mod analysis;
 pub mod config;
+
 use cannonical::{CannonicalFork, Forked};
 use config::{Config, LinkType};
 // pub mod errors;
 
-pub const LOGGER_TARGET_MAIN: &str = "slot0";
-pub const LOGGER_TARGET_SYNC: &str = "slot0::sync";
-pub const LOGGER_TARGET_API: &str = "slot0::api";
-pub const LOGGER_TARGET_SIMULATION: &str = "slot0::sim";
+pub const LOGGER_TARGET_MAIN: &str = "forky";
+pub const LOGGER_TARGET_SYNC: &str = "forky::sync";
+pub const LOGGER_TARGET_LOADS: &str = "forky::sync::loads";
+pub const LOGGER_TARGET_API: &str = "forky::api";
+pub const LOGGER_TARGET_SIMULATION: &str = "forky::sim";
 
 #[derive(Debug, Clone)]
 pub struct TransactionRequest {
@@ -135,7 +139,7 @@ impl ApplicationState {
         // The cannonical depends on a RPC it can trust to provice accurate storage slot diffs between each block
 
         let reader = self.cannonical.clone();
-        let block_env = reader.block_env().await;
+        let block_env = reader.block_env();
 
         let out = Arc::new(Mutex::new(ActiveFork {
             db: revm::db::CacheDB::<Forked>::new(Forked {
@@ -163,28 +167,31 @@ impl ApplicationState {
                 return Err(e);
             }
         };
-        if next.len() > 10 {
-            let mut run = next;
-            let s = self.cannonical.clone();
-            tokio::spawn(async move {
-                loop {
-                    log::info!(target: LOGGER_TARGET_MAIN, "Loading {} more addresses", run.len());
-                    let next = match s.load_positions(
-                        run
-                    ).await {
-                        eyre::Result::Ok(v) => v,
-                        Err(e) => {
-                            log::error!(target: LOGGER_TARGET_MAIN, "Failed to preload {}", e);
-                            return Err(e);
-                        }
-                    };
-                    if next.len() < 10 {
-                        return Ok(())
-                    }
-                    run = next;
-                }
-            });
+        if next.is_empty() {
+            return Ok(());
         }
+        let mut run = next;
+        let s = self.cannonical.clone();
+        tokio::spawn(async move {
+            for _ in 0..10 {
+                log::info!(target: LOGGER_TARGET_MAIN, "Loading {} more addresses", run.len());
+                let next = match s.load_positions(
+                    run
+                ).await {
+                    eyre::Result::Ok(v) => v,
+                    Err(e) => {
+                        log::error!(target: LOGGER_TARGET_MAIN, "Failed to preload {}", e);
+                        return Err(e);
+                    }
+                };
+                if next.is_empty() {
+                    break;
+                }
+                run = next;
+            }
+            Ok(())
+
+        });
         Ok(())
         
     }
@@ -413,6 +420,14 @@ impl revm::Inspector<&mut CacheDB<Forked>> for LogTracer {
             return;
         }
     }
+    // fn call(&mut self, context: &mut revm::EvmContext<&mut  CacheDB<Forked>> ,inputs: &mut revm::interpreter::CallInputs,) -> Option<revm::interpreter::CallOutcome> {
+    //     for slot in context.db.db.cannonical.call(inputs) {
+    //         if let Err(e) = context.db.storage_ref(inputs.target_address, slot) {
+    //             log::error!(target: LOGGER_TARGET_MAIN, "Failed to fetch storage for {}: {:?}", inputs.target_address, e);
+    //         }
+    //     }
+    //     return None;
+    // }
     fn log(
         &mut self,
         _: &mut revm::interpreter::Interpreter,

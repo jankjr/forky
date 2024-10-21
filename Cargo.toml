@@ -36,6 +36,5 @@ sdd = "3.0.4"
 
 itertools = "0.13.0"
 async_cell = "0.2.2"
-evm-disassembler = "0.5.0"
 iset = "0.3.0"
 match_deref = "0.1.1"

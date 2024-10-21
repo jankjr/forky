@@ -1,8 +1,3 @@
-use crate::{
-    analysis::{perform_analysis, AnalyzedStoragesSlot, SlotType},
-    config::LinkType,
-    LOGGER_TARGET_SYNC,
-};
 use alloy::{
     eips::BlockId,
     hex::FromHex,
@@ -26,22 +21,30 @@ use alloy_provider::{
     Provider,
 };
 use async_cell::sync::AsyncCell;
+use bytes::Buf;
 use eyre::{Context, ContextCompat};
-use futures::{future::try_join_all, FutureExt};
+use futures::{future::try_join_all, FutureExt, TryFutureExt};
 use itertools::Itertools;
-use revm::primitives::{keccak256, Address, Bytecode, Bytes, B256, KECCAK_EMPTY, U256};
+use revm::primitives::{
+    keccak256, Address, BlobExcessGasAndPrice, Bytecode, Bytes, SpecId::GRAY_GLACIER, B256,
+    KECCAK_EMPTY, U256,
+};
 use revm::{db::DatabaseRef, primitives::AccountInfo, Database};
 // use rustc_hash::FxBuildHasher;
 use alloy::hex;
+use rustc_hash::FxBuildHasher;
 use scc::hash_map::Entry;
-use sdd::{AtomicShared, Guard, Shared, Tag};
+use sdd::{AtomicOwned, AtomicShared, Guard, Shared, Tag};
 use std::{
-    clone,
     collections::{BTreeMap, HashSet},
     future::IntoFuture,
-    sync::Arc,
+    sync::{atomic::AtomicBool, Arc},
 };
-use tokio::{runtime::Handle, sync::RwLock};
+use tokio::{runtime::Handle, sync::Semaphore};
+
+use crate::{
+    abstract_value::{ArgType, SlotType, ADDR_MASK}, analysis::{perform_analysis, AnalysisContext, AnalyzedStoragesSlot}, config::LinkType, utils::is_address_like, LOGGER_TARGET_LOADS, LOGGER_TARGET_SYNC
+};
 
 // type AddressHasher = hash_hasher::HashBuildHasher;
 // type IndexHasher = FxBuildHasher;
@@ -54,7 +57,6 @@ pub struct Forked {
     pub cannonical: Arc<CannonicalFork>,
     pub env: revm::primitives::BlockEnv,
     pub seconds_per_block: U256,
-    // pub dry_run: bool,
 }
 
 static PROXY_SLOT: U256 = U256::from_be_bytes(hex!(
@@ -67,8 +69,9 @@ static ADMIN_SLOT: U256 = U256::from_be_bytes(hex!(
     "10d6a54a4754c8869d6886b5f5d7fbfa5b4522237ea5c60d11bc4e7a1ff9390b"
 ));
 
-static SLOTS_TO_FETCH_ON_RUNNING: usize = 5;
-static SLOTS_TO_FETCH_PREFETCH: usize = 20;
+static SLOTS_TO_FETCH_ON_RUNNING: usize = 2;
+static SLOTS_TO_FETCH_PREFETCH: usize = 5;
+static MAX_ARRAY_ENTRIES_TO_PRELOAD: usize = 100;
 
 impl Forked {
     // pub fn set_dry_run(&mut self, dry_run: bool) {
@@ -142,7 +145,7 @@ impl DatabaseRef for Forked {
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
         log::trace!(target: LOGGER_TARGET_SYNC, "call storage({}, {})", address, index);
         let out = Forked::block_on(async { self.cannonical.clone().storage(address, index).await });
-        log::debug!(target: LOGGER_TARGET_SYNC, "return storage({}, {}) => {:?}", address, index, out);
+        // log::debug!(target: LOGGER_TARGET_SYNC, "return storage({}, {}) => {:?}", address, index, out);
 
         out
     }
@@ -189,6 +192,88 @@ enum StorageData {
     Live(U256),
 }
 
+type Mapper = (U256, Vec<SlotType>, SlotType, Vec<ArgType>);
+#[derive(Debug, Clone)]
+struct MappingData {
+    consumed: scc::HashSet<u64>,
+    in_use: AtomicShared<bool>,
+
+    // Does not contain Calldata, can be cleared after 1 call
+    context_slots: Vec<Mapper>,
+
+    // Only contains args with at least 1 Calldata
+    call_dependent_slots: scc::HashIndex<u32, Vec<Mapper>, FxBuildHasher>,
+}
+
+impl MappingData {
+    fn consume(&mut self, addr: &U256, selector: u32) -> bool {
+        let key = addr.as_limbs()[0] ^ (selector as u64);
+        if self.consumed.contains(&key) {
+            return false;
+        }
+        if let Err(_) = self.consumed.insert(key) {
+            return false;
+        };
+        true
+    }
+    fn context_consumed(&mut self, addr: &Address) -> bool {
+        let key: u64 = u64::from_be_bytes([
+            addr.0[0], addr.0[1], addr.0[2], addr.0[3], addr.0[4], addr.0[5], addr.0[6], addr.0[7],
+        ]);
+        if let Some(_) = self.consumed.read(&key, |v| true) {
+            return false;
+        }
+        if let Err(_) = self.consumed.insert(key) {
+            return false;
+        };
+        true
+    }
+}
+
+impl MappingData {
+    fn new(mapping_data: &Vec<AnalyzedStoragesSlot>) -> Self {
+        let mut context_slots: Vec<Mapper> = Vec::new();
+        let mut slot_map = std::collections::HashMap::new();
+        for slot in mapping_data {
+            match slot {
+                AnalyzedStoragesSlot::Mapping(slot, map, typ, args) => {
+                    for args in args.iter() {
+                        // context_slots
+                        if args.iter().all(|v| v.selector() == 0u32) {
+                            context_slots.push((
+                                slot.clone(),
+                                map.clone(),
+                                typ.clone(),
+                                args.clone(),
+                            ));
+                        } else {
+                            let selector = args.first().unwrap().selector();
+                            let entry = slot_map.entry(selector).or_insert(Vec::new());
+
+                            entry.push((slot.clone(), map.clone(), typ.clone(), args.clone()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let call_dependent_slots = scc::HashIndex::with_capacity_and_hasher(
+            slot_map.len() as usize,
+            FxBuildHasher::default(),
+        );
+        for (sel, mappers) in slot_map {
+            call_dependent_slots.insert(sel, mappers).unwrap();
+        }
+        Self {
+            consumed: scc::HashSet::with_hasher(Default::default()),
+            context_slots,
+            in_use: AtomicShared::new(false),
+            call_dependent_slots,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CannonicalFork {
     // Results fetched from the provider and maintained by apply_next_mainnet_block,
@@ -198,6 +283,7 @@ pub struct CannonicalFork {
     block_hashes: scc::HashMap<u64, B256>,
     storage: scc::HashIndex<Address, scc::HashIndex<U256, StorageData, IndexHasher>, AddressHasher>,
     accounts: scc::HashIndex<Address, AccountData, AddressHasher>,
+    mappings: scc::HashMap<Address, MappingData, AddressHasher>,
 
     current_block: AtomicShared<Block>,
     provider: alloy::providers::RootProvider<BoxTransport>,
@@ -207,7 +293,6 @@ pub struct CannonicalFork {
 const DEFAULT_CAPACITY_ACCOUNTS: usize = 1024;
 const DEFAULT_SLACK: usize = 8;
 const DEFAULT_STORAGE_PR_ACCOUNT: usize = 512;
-static ADDR_MASK: U256 = U256::from_be_slice(&hex!("ffffffffffffffffffffffffffffffffffffffff"));
 impl CannonicalFork {
     pub fn new(
         provider: alloy::providers::RootProvider<BoxTransport>,
@@ -222,6 +307,10 @@ impl CannonicalFork {
                 AddressHasher::default(),
             ),
             storage: scc::HashIndex::with_capacity_and_hasher(
+                DEFAULT_CAPACITY_ACCOUNTS * DEFAULT_SLACK,
+                AddressHasher::default(),
+            ),
+            mappings: scc::HashMap::with_capacity_and_hasher(
                 DEFAULT_CAPACITY_ACCOUNTS * DEFAULT_SLACK,
                 AddressHasher::default(),
             ),
@@ -250,7 +339,7 @@ impl CannonicalFork {
         Ok(())
     }
 
-    pub async fn block_env(&self) -> revm::primitives::BlockEnv {
+    pub fn block_env(&self) -> revm::primitives::BlockEnv {
         let g = Guard::new();
         let block = self
             .current_block
@@ -262,8 +351,14 @@ impl CannonicalFork {
             timestamp: U256::from(block.header.timestamp),
             gas_limit: U256::from(block.header.gas_limit),
             coinbase: block.header.miner,
+            blob_excess_gas_and_price: Some(BlobExcessGasAndPrice {
+                excess_blob_gas: block.header.excess_blob_gas.unwrap_or_default(),
+                blob_gasprice: block.header.blob_fee().unwrap_or_default(),
+            }),
+            prevrandao: block.header.mix_hash,
             difficulty: block.header.difficulty,
             basefee: U256::from(block.header.base_fee_per_gas.unwrap_or(1u64)),
+
             ..Default::default()
         }
     }
@@ -510,6 +605,8 @@ impl CannonicalFork {
             tokio::spawn(async move {
                 let offset = offset.clone();
                 let provider = provider.clone();
+
+                log::trace!(target: LOGGER_TARGET_LOADS, "load_storage_slots > get_storage_at({}, {})", address, offset);
                 return (
                     offset,
                     provider
@@ -547,6 +644,7 @@ impl CannonicalFork {
                 }
             };
             let block_id = BlockId::from(block_num);
+            log::trace!(target: LOGGER_TARGET_LOADS, "load_proxy_contract_code({})", address);
             let (balance, code) = tokio::try_join!(
                 self.provider
                     .get_balance(address)
@@ -584,7 +682,7 @@ impl CannonicalFork {
         incode: Bytecode,
         contract_address: &Address,
     ) -> eyre::Result<(Vec<AnalyzedStoragesSlot>, Vec<Address>)> {
-        log::debug!(target: LOGGER_TARGET_SYNC, "(Analysis) analyzing contract {}", contract_address);
+        log::debug!(target: LOGGER_TARGET_LOADS, "(Analysis) analyzing contract {}", contract_address);
 
         let (slot_data, contract_refs) = if !proxy_slot_value.is_zero() {
             let implementation_addr: U160 = proxy_slot_value.to();
@@ -593,10 +691,15 @@ impl CannonicalFork {
                 .load_proxy_contract_code(implementation_addr, block_num)
                 .await?;
 
-            perform_analysis(&code, true)?
+            perform_analysis(&code, &AnalysisContext::from(&self.block_env()))?
         } else {
-            perform_analysis(&incode, true)?
+            perform_analysis(&incode, &AnalysisContext::from(&self.block_env()))?
         };
+
+        log::debug!(target: LOGGER_TARGET_LOADS, "Layout of {}:", contract_address);
+        for slot in slot_data.iter() {
+            log::debug!(target: LOGGER_TARGET_LOADS, "  {}", slot);
+        }
 
         let min = U256::from(slots_loaded);
 
@@ -605,7 +708,6 @@ impl CannonicalFork {
             .cloned()
             .filter(|v| match v {
                 AnalyzedStoragesSlot::Slot(slot, _) => slot.gt(&min),
-                AnalyzedStoragesSlot::Mapping(_, _, _) => false,
                 _ => true,
             })
             .collect::<Vec<_>>();
@@ -614,36 +716,6 @@ impl CannonicalFork {
             log::debug!(target: LOGGER_TARGET_SYNC, "(Analysis) slot: {}: {}", contract_address, index);
         }
         Ok((additional_slots, contract_refs))
-    }
-
-    async fn load_slots(
-        &self,
-        address: &Address,
-        indices: &Vec<U256>,
-        block_num: u64,
-    ) -> eyre::Result<Vec<(U256, U256)>> {
-        let block_id = BlockId::from(block_num);
-
-        let address = address.clone();
-        let values = try_join_all(
-            indices
-                .iter()
-                .cloned()
-                .map(|index| {
-                    self.provider
-                        .get_storage_at(address, index)
-                        .block_id(block_id)
-                        .into_future()
-                })
-                .collect::<Vec<_>>(),
-        )
-        .await?;
-
-        Ok(indices
-            .into_iter()
-            .cloned()
-            .zip(values.into_iter())
-            .collect::<Vec<_>>())
     }
 
     async fn run_new_account_analysis(
@@ -682,6 +754,15 @@ impl CannonicalFork {
         let mut account_refs: Vec<Address> = Vec::new();
 
         if !analyzed_slots.is_empty() {
+            self.init_account_mappings(
+                &address,
+                &analyzed_slots
+                    .iter()
+                    .filter(|v| v.is_mapping())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            );
+
             let slots = try_join_all(
                 analyzed_slots
                     .iter()
@@ -693,9 +774,9 @@ impl CannonicalFork {
             .unique()
             .collect::<Vec<_>>();
 
-            for (typ, slot, value) in slots.into_iter() {
-                if typ == SlotType::Address {
-                    account_refs.push(Address::from(U160::from(value)));
+            for (_, slot, value) in slots.into_iter() {
+                if is_address_like(&value) {
+                    account_refs.push(Address::from(U160::from(value & ADDR_MASK)));
                 }
                 account_slots.push((slot, value));
             }
@@ -721,6 +802,7 @@ impl CannonicalFork {
         let (balance, code) = if address.lt(&min) {
             (U256::from(0), Bytes::new())
         } else {
+            log::trace!(target: LOGGER_TARGET_LOADS, "fetch_minimal_account_info({})", address);
             futures::try_join!(
                 provider
                     .get_balance(address)
@@ -768,6 +850,116 @@ impl CannonicalFork {
         Ok(info)
     }
 
+    pub fn call(&self, inputs: &revm::interpreter::CallInputs) -> Vec<revm::primitives::U256> {
+        if inputs.input.len() < 4 {
+            return Vec::new();
+        }
+        let selector = inputs.input.slice(0..4).get_u32();
+        let to = inputs.target_address;
+
+        let mut mappings = if let Some(e) = self.mappings.read(&to, |_, v| v.clone()) {
+            e
+        } else {
+            return Vec::new();
+        };
+
+        let input_dep = mappings
+            .call_dependent_slots
+            .peek_with(&selector, |_, mappings| mappings.clone())
+            .unwrap_or_default();
+
+        let to_check: Vec<Mapper> = if mappings.context_consumed(&inputs.caller) {
+            mappings
+                .context_slots
+                .iter()
+                .chain(input_dep.iter())
+                .cloned()
+                .collect()
+        } else {
+            input_dep
+        };
+        if to_check.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut extra_loads = Vec::new();
+
+        for slot_data in to_check {
+            let (contract_storage_slot, _, _, args) = slot_data;
+
+            let mut out_index = U256::ZERO;
+
+            let mut buff: [u8; 64] = [0; 64];
+            buff[32..64].copy_from_slice(&contract_storage_slot.to_be_bytes::<32>());
+            let mut contains_arg = false;
+            for arg_type in args.iter() {
+                let mut sel = 0;
+                match arg_type {
+                    ArgType::MsgSender => {
+                        let arg = inputs.caller.into_word();
+                        let arg: U256 = arg.into();
+                        buff[0..32].copy_from_slice(arg.to_be_bytes::<32>().as_slice());
+                    }
+                    ArgType::This => {
+                        let arg = inputs.target_address.into_word();
+                        let arg: U256 = arg.into();
+
+                        buff[0..32].copy_from_slice(arg.to_be_bytes::<32>().as_slice());
+                    }
+                    ArgType::Calldata(_, index) => {
+                        let start = 4 + (*index * 32);
+                        let end = start + 32;
+                        if inputs.input.len() < end {
+                            out_index = U256::ZERO;
+                            break;
+                        }
+
+                        contains_arg = true;
+
+                        let arg = U256::from_be_slice(&inputs.input[start..end]);
+                        sel = selector;
+
+                        buff[0..32].copy_from_slice(arg.to_be_bytes::<32>().as_slice());
+                    }
+                }
+                let index_bytes = keccak256(&buff);
+                let storage_slot: U256 = index_bytes.into();
+
+                if storage_slot.is_zero() {
+                    out_index = U256::ZERO;
+                    break;
+                }
+
+                if !mappings.consume(&storage_slot, sel) {
+                    out_index = U256::ZERO;
+                    break;
+                }
+
+                out_index = storage_slot;
+                buff[0..32].copy_from_slice([0u8; 32].as_slice());
+                buff[32..64].copy_from_slice(&storage_slot.to_be_bytes::<32>());
+            }
+            if out_index.is_zero() {
+                continue;
+            }
+
+            match self.storage.peek_with(&inputs.target_address, |_, v| {
+                v.peek_with(&out_index, |_, v| true)
+            }) {
+                Some(Some(true)) => continue,
+                _ => {}
+            }
+
+            if contains_arg {
+                extra_loads.push(out_index);
+            }
+            log::trace!(target: LOGGER_TARGET_LOADS, "(Analysis) get_storage_at({}, {})", inputs.target_address, out_index);
+            out.push(out_index);
+        }
+
+        return out;
+    }
+
     async fn load_acc_info(
         &self,
         address: Address,
@@ -782,44 +974,35 @@ impl CannonicalFork {
         let mut contracts_referenced = Vec::new();
         let provider = self.provider.clone();
 
-        let data_handle = tokio::spawn(async move {
-            let provider = provider.clone();
-            let block_id = BlockId::from(block_num);
-            futures::try_join!(
-                provider
-                    .get_balance(address)
-                    .block_id(block_id)
-                    .into_future(),
-                provider
-                    .get_code_at(address)
-                    .block_id(block_id)
-                    .into_future(),
-                provider
-                    .get_storage_at(address, PROXY_SLOT)
-                    .block_id(block_id)
-                    .into_future(),
-                provider
-                    .get_storage_at(address, PROXY_SLOT_2)
-                    .block_id(block_id)
-                    .into_future(),
-                provider
-                    .get_storage_at(address, ADMIN_SLOT)
-                    .block_id(block_id)
-                    .into_future()
-            )
-        })
-        .map(|v| match v {
-            Ok(Ok(tup)) => eyre::Result::Ok(tup),
-            e => eyre::Result::Err(eyre::eyre!("Failed to fetch storage {:?}", e)),
-        });
+        let block_id = BlockId::from(block_num);
 
-        let (
-            (balance, code, proxy_slot_value1, proxy_slot_value2, admin_value),
-            mut preloaded_slots,
-        ) = futures::try_join!(
-            data_handle,
+        log::trace!(target: LOGGER_TARGET_LOADS, "load_acc_info({})", address);
+        let data_handle = futures::try_join!(
+            provider
+                .get_balance(address)
+                .block_id(block_id)
+                .into_future()
+                .map_err(|e| eyre::eyre!("Failed to fetch balance for {}: {:?}", address, e)),
+            provider
+                .get_code_at(address)
+                .block_id(block_id)
+                .into_future()
+                .map_err(|e| eyre::eyre!("Failed to fetch code for {}: {:?}", address, e)),
+            provider
+                .get_storage_at(address, PROXY_SLOT)
+                .block_id(block_id)
+                .into_future()
+                .map_err(|e| eyre::eyre!("Failed to fetch proxy slot for {}: {:?}", address, e)),
+            provider
+                .get_storage_at(address, PROXY_SLOT_2)
+                .block_id(block_id)
+                .into_future()
+                .map_err(|e| eyre::eyre!("Failed to fetch proxy slot 2 for {}: {:?}", address, e)),
             self.load_storage_slots(address, U256::from(0), block_num, slots)
         )?;
+
+        let (balance, code, proxy_slot_value1, proxy_slot_value2, mut preloaded_slots) =
+            data_handle;
 
         let code = if code.len() == 0 {
             None
@@ -829,7 +1012,6 @@ impl CannonicalFork {
 
         preloaded_slots.push((PROXY_SLOT, proxy_slot_value1));
         preloaded_slots.push((PROXY_SLOT_2, proxy_slot_value2));
-        preloaded_slots.push((ADMIN_SLOT, admin_value));
 
         // Run analysis
 
@@ -843,6 +1025,15 @@ impl CannonicalFork {
                 .load_acc_info_analysis(block_num, slots, proxy_slot_value, code.clone(), &address)
                 .await?;
 
+            self.init_account_mappings(
+                &address,
+                &additional_slots
+                    .iter()
+                    .filter(|v| v.is_mapping())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            );
+
             contracts_referenced.extend(refs);
             let additional_slots = try_join_all(
                 additional_slots
@@ -855,10 +1046,8 @@ impl CannonicalFork {
             .unique()
             .collect::<Vec<_>>();
 
-            for (typ, index, value) in additional_slots {
-                if typ == SlotType::Address && value.gt(&U256::from(0xffffffffffffffffu64)) {
-                    contracts_referenced.push(Address::from(U160::from(value & ADDR_MASK)));
-                } else if value.lt(&ADDR_MASK) && value.gt(&U256::from(0xffffffffffffffffu64)) {
+            for (_, index, value) in additional_slots {
+                if is_address_like(&value) {
                     contracts_referenced.push(Address::from(U160::from(value & ADDR_MASK)));
                 }
                 preloaded_slots.push((index, value));
@@ -1030,6 +1219,14 @@ impl CannonicalFork {
         ) {}
     }
 
+    #[inline]
+    fn init_account_mappings(&self, address: &Address, mappings: &Vec<AnalyzedStoragesSlot>) {
+        // if self.mappings.contains(address) {
+        //     return;
+        // }
+        // if let Err(_) = self.mappings.insert(*address, MappingData::new(mappings)) {}
+    }
+
     async fn fetch_analyzed_slot(
         &self,
         address: &Address,
@@ -1049,16 +1246,18 @@ impl CannonicalFork {
                 log::debug!(target: LOGGER_TARGET_SYNC, "fetch_analyzed_slot({}, {})", address, slot);
                 let len = self.fetch_storage(*address, *slot, block_number).await?;
 
-                let entries_to_fetch: usize = U256::min(len.clone(), U256::from(20)).to();
-                let mut out = vec![(SlotType::Uint, *slot, len)];
+                let entries_to_fetch: usize =
+                    U256::min(len.clone(), U256::from(MAX_ARRAY_ENTRIES_TO_PRELOAD)).to();
+                let mut out = vec![(SlotType::Unknown, *slot, len)];
                 if len.lt(&U256::from(10000)) && entries_to_fetch != 0 {
-                    log::debug!(target: LOGGER_TARGET_SYNC, "fetch_analyzed_slot({}, {}): Loading {} array entries out of {}", address, slot, entries_to_fetch, len);
+                    log::debug!(target: LOGGER_TARGET_LOADS, "fetch_analyzed_slot({}, {}): Loading {} array entries out of {}", address, slot, entries_to_fetch, len);
                     let slot = *slot;
                     let address = address.clone();
                     let array_data_offset: U256 = keccak256::<[u8; 32]>(slot.to_be_bytes()).into();
                     let slot_indices = (0..entries_to_fetch)
                         .map(|offset_from_start| array_data_offset + U256::from(offset_from_start))
                         .collect::<Vec<_>>();
+
                     let res =
                         try_join_all(slot_indices.iter().map(|index| {
                             self.fetch_storage(address.clone(), *index, block_number)
@@ -1070,7 +1269,9 @@ impl CannonicalFork {
                 }
                 out
             }
-            AnalyzedStoragesSlot::Mapping(slot, _, _) => vec![(SlotType::Uint, *slot, U256::ZERO)],
+            AnalyzedStoragesSlot::Mapping(slot, _, _, _) => {
+                vec![(SlotType::Unknown, *slot, U256::ZERO)]
+            }
         };
 
         Ok(v)
@@ -1100,6 +1301,7 @@ impl CannonicalFork {
             Ok(_) => {}
         };
 
+        log::trace!(target: LOGGER_TARGET_LOADS, "get_storage_at({}, {})", address, index);
         let data = self
             .provider
             .get_storage_at(address, index)

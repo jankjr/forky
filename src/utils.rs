@@ -1,4 +1,7 @@
-use alloy::transports::BoxTransport;
+use alloy::{hex, transports::BoxTransport};
+use revm::primitives::U256;
+
+use crate::abstract_value::ADDR_MASK;
 
 
 pub async fn provider_from_string(url: &String) -> eyre::Result<alloy::providers::RootProvider<BoxTransport>> {
@@ -12,4 +15,11 @@ pub async fn provider_from_string(url: &String) -> eyre::Result<alloy::providers
     };
     
     Ok(out)
+}
+static MIN_ADDR_VAL: U256 = U256::from_be_slice(&hex!("c0d7d3017b342ff039b55b0879"));
+
+
+pub fn is_address_like(value: &U256) -> bool {
+    let zeros: usize = value.count_zeros();
+    value.lt(&ADDR_MASK) && value.gt(&MIN_ADDR_VAL) && zeros < 200 && zeros > 160
 }
