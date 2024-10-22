@@ -1,6 +1,6 @@
 {
   "name": "@slot0/forky",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "publishConfig": {
     "access": "public",
     "tag": "latest"
@@ -31,6 +31,8 @@
   "files": [
     "index.node",
     "types.d.ts",
+    "cargo.toml",
+    "cargo.lock",
     "src/*.rs"
 
   ],
