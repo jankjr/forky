@@ -10,7 +10,6 @@ use revm::{
     primitives::{keccak256, Address, BlockEnv, Bytecode, FixedBytes, U256},
 };
 
-use std::borrow::Borrow;
 use std::{
     borrow::BorrowMut,
     collections::{hash_map::Entry, HashMap, HashSet},
@@ -123,7 +122,7 @@ impl AnalysisContext {
  */
 use crate::LOGGER_TARGET_MAIN;
 
-// static MAX_STEPS: usize = 4000;
+static MAX_STEPS: usize = 400;
 
 #[warn(dead_code)]
 fn sign_extend(ext: U256, x: U256) -> U256 {
@@ -142,7 +141,7 @@ fn sign_extend(ext: U256, x: U256) -> U256 {
     }
 }
 
-static MAX_REVISITS: usize = 7;
+static MAX_REVISITS: usize = 5;
 
 pub fn decode_operation<'a>(
     bytes: &'a [u8],
@@ -736,11 +735,11 @@ impl<'a> AbstractVMInstance<'a> {
             return Ok(StepResult::Stop);
         }
 
-        // if self.steps > MAX_STEPS {
-        //     // println!("MAX STEPS");
-        //     self.halted = true;
-        //     return Ok(StepResult::Stop);
-        // }
+        if self.steps > MAX_STEPS {
+            // println!("MAX STEPS");
+            self.halted = true;
+            return Ok(StepResult::Stop);
+        }
 
         let ins = self.program.get(self.pc);
 
@@ -1594,7 +1593,7 @@ pub fn perform_analysis(
 mod tests {
     use alloy::{eips::BlockId, hex};
     use alloy_provider::Provider;
-    use revm::primitives::{Bytecode, TxKind};
+    use revm::primitives::Bytecode;
 
     use crate::utils::provider_from_string;
 
