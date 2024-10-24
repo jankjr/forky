@@ -47,6 +47,8 @@ interface SimTransactionRequest {
 
     // Nonces are not checked
     nonce?: bigint;
+
+    accessList?: {address: string, storageKeys: string[]}[]
 }
 
 export type OnLogFn = (log: Log) => void;

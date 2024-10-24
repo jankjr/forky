@@ -26,8 +26,8 @@ use eyre::{Context, ContextCompat};
 use futures::{future::try_join_all, FutureExt, TryFutureExt};
 use itertools::Itertools;
 use revm::primitives::{
-    keccak256, Address, BlobExcessGasAndPrice, Bytecode, Bytes, SpecId::GRAY_GLACIER, B256,
-    KECCAK_EMPTY, U256,
+    keccak256, AccessList, Address, BlobExcessGasAndPrice, Bytecode, Bytes, SpecId::GRAY_GLACIER,
+    B256, KECCAK_EMPTY, U256,
 };
 use revm::{db::DatabaseRef, primitives::AccountInfo, Database};
 // use rustc_hash::FxBuildHasher;
@@ -43,7 +43,11 @@ use std::{
 use tokio::{runtime::Handle, sync::Semaphore};
 
 use crate::{
-    abstract_value::{ArgType, SlotType, ADDR_MASK}, analysis::{perform_analysis, AnalysisContext, AnalyzedStoragesSlot}, config::LinkType, utils::is_address_like, LOGGER_TARGET_LOADS, LOGGER_TARGET_SYNC
+    abstract_value::{ArgType, SlotType, ADDR_MASK},
+    analysis::{perform_analysis, AnalysisContext, AnalyzedStoragesSlot},
+    config::LinkType,
+    utils::is_address_like,
+    LOGGER_TARGET_LOADS, LOGGER_TARGET_SYNC,
 };
 
 // type AddressHasher = hash_hasher::HashBuildHasher;
@@ -132,7 +136,7 @@ impl DatabaseRef for Forked {
     #[inline]
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         log::trace!(target: LOGGER_TARGET_SYNC, "basic({})", address);
-        Forked::block_on(async { self.cannonical.clone().basic(address).await })
+        Forked::block_on(async { self.cannonical.clone().basic(address, true).await })
     }
 
     #[inline]
@@ -673,7 +677,26 @@ impl CannonicalFork {
             None => return Err(eyre::eyre!("Proxy implementation not found {}", address)),
         }
     }
+    pub async fn load_access_list(&self, list: &AccessList) -> eyre::Result<()> {
+        let block_number: u64 = self.get_current_block();
+        try_join_all(list.iter().map(|item|{
+            let address = item.address;
+            let f = async move {
+                self.basic(address, false).await?;
 
+                try_join_all(item
+                    .storage_keys
+                    .iter()
+                    .map(|v| {
+                        let index: U256 = v.clone().into();
+                        self.fetch_storage(address, index, block_number)
+                    })
+                ).await
+            };
+            futures::TryFutureExt::into_future(f)
+        })).await;
+        Ok(())
+    }
     async fn load_acc_info_analysis(
         &self,
         block_num: u64,
@@ -832,19 +855,22 @@ impl CannonicalFork {
         &self,
         address: Address,
         block_num: u64,
+        perform_analysis: bool,
     ) -> eyre::Result<AccountInfo> {
         let info: AccountInfo = self.fetch_minimal_account_info(address, block_num).await?;
 
         if let Some(code) = &info.code {
             let s = self.clone();
             let first_acc_code = code.clone();
-            tokio::spawn(async move {
-                let code = first_acc_code;
-                match s.run_new_account_analysis(address, code, block_num).await {
-                    Err(_) => return,
-                    Ok(accounts) => accounts,
-                };
-            });
+            if perform_analysis {
+                tokio::spawn(async move {
+                    let code = first_acc_code;
+                    match s.run_new_account_analysis(address, code, block_num).await {
+                        Err(_) => return,
+                        Ok(accounts) => accounts,
+                    };
+                });
+            }
         };
 
         Ok(info)
@@ -1144,6 +1170,7 @@ impl CannonicalFork {
     async fn basic(
         &self,
         address: Address, // dry_run: bool,
+        perform_analysis: bool,
     ) -> eyre::Result<Option<AccountInfo>> {
         if let Some(value) = self.peek_account_info(&address).await {
             return Ok(Some(value));
@@ -1156,12 +1183,14 @@ impl CannonicalFork {
 
         log::trace!(target: LOGGER_TARGET_SYNC, "(Cache miss) Fetching account {}", address);
         let block_number: u64 = self.get_current_block();
-        let info = self.load_acc_info_live(address, block_number).await?;
+        let info = self
+            .load_acc_info_live(address, block_number, perform_analysis)
+            .await?;
         cell.set(info.clone());
         Ok(Some(info))
     }
     pub async fn get_account_data(&self, address: &Address) -> eyre::Result<Option<AccountInfo>> {
-        self.basic(address.clone()).await
+        self.basic(address.clone(), true).await
     }
     #[inline]
     async fn peek_account_info(&self, address: &Address) -> Option<AccountInfo> {

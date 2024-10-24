@@ -4,6 +4,8 @@ use alloy::transports::BoxTransport;
 
 use alloy_provider::Provider;
 use neon::prelude::Context;
+use revm::primitives::AccessList;
+use revm::primitives::AccessListItem;
 use scc::hash_set::HashSet;
 use eyre::ContextCompat;
 use eyre::Ok;
@@ -59,7 +61,9 @@ pub struct TransactionRequest {
     pub gas_price: Option<U256>,
     pub gas_priority_fee: Option<U256>,
     pub max_fee_per_gas: Option<U256>,
-    pub gas_limit: Option<U256>
+    pub gas_limit: Option<U256>,
+
+    pub access_list: Option<AccessList>
 }
 pub struct ApplicationState {
     pub cannonical: Arc<CannonicalFork>,
@@ -172,27 +176,24 @@ impl ApplicationState {
         }
         let mut run = next;
         let s = self.cannonical.clone();
-        tokio::spawn(async move {
-            for _ in 0..10 {
-                log::info!(target: LOGGER_TARGET_MAIN, "Loading {} more addresses", run.len());
-                let next = match s.load_positions(
-                    run
-                ).await {
-                    eyre::Result::Ok(v) => v,
-                    Err(e) => {
-                        log::error!(target: LOGGER_TARGET_MAIN, "Failed to preload {}", e);
-                        return Err(e);
-                    }
-                };
-                if next.is_empty() {
-                    break;
+        for _ in 0..2 {
+            log::info!(target: LOGGER_TARGET_MAIN, "Loading {} more addresses", run.len());
+            let next = match s.load_positions(
+                run
+            ).await {
+                eyre::Result::Ok(v) => v,
+                Err(e) => {
+                    log::error!(target: LOGGER_TARGET_MAIN, "Failed to preload {}", e);
+                    return Err(e);
                 }
-                run = next;
+            };
+            if next.len() < 10 {
+                break;
             }
-            Ok(())
-
-        });
+            run = next;
+        }
         Ok(())
+
         
     }
 
@@ -314,6 +315,7 @@ fn js_value_to_bytes<'a>(
     let out = hex::decode(down_casted.value(cx).as_str()).wrap_err("Failed to parse");
     to_neon(cx, out)
 }
+
 fn js_value_to_uint256<'a>(
     cx: &mut neon::context::FunctionContext<'a>,
     js_val: Handle<'a, JsValue>,
@@ -321,6 +323,20 @@ fn js_value_to_uint256<'a>(
     let down_casted: Handle<'a, JsBigInt> =
         js_val.downcast_or_throw::<JsBigInt, neon::context::FunctionContext<'a>>(cx)?;
     bigint_to_u256(down_casted, cx)
+}
+fn js_value_to_b256<'a>(
+    cx: &mut neon::context::FunctionContext<'a>,
+    js_val: Handle<'a, JsValue>,
+) -> neon::result::NeonResult<revm::primitives::B256> {
+    use eyre::WrapErr;
+    let down_casted: Handle<'a, JsString> =
+        js_val.downcast_or_throw::<JsString, neon::context::FunctionContext<'a>>(cx)?;
+    let value = down_casted.value(cx);
+    let out = revm::primitives::B256::from_str(
+        &value
+    );
+    
+    to_neon(cx, out.wrap_err("Failed to parse"))
 }
 fn get_optional_bigint<'a>(
     js_val: NeonResult<Option<Handle<'a, JsBigInt>>>,
@@ -350,6 +366,33 @@ fn js_obj_tx_to_transaction<'a>(
     let max_fee_per_gas = get_optional_bigint(js_obj_tx.get_opt::<JsBigInt, _, _>(&mut cx, "maxFeePerGas"), &mut cx)?;
     let value = get_optional_bigint(js_obj_tx.get_opt::<JsBigInt, _, _>(&mut cx, "value"), &mut cx)?.unwrap_or_default();
 
+    let access_list = if let Some(v) = js_obj_tx.get_opt::<JsArray, _, _>(&mut cx, "accessList")? {
+        let mut out = Vec::new();
+        let length = v.len(&mut cx);
+        for i in 0..length {
+            let item: Handle<JsObject> = v.get(&mut cx, i)?;
+            let address = item.get(&mut cx, "address")?;
+            let address = js_value_to_address(&mut cx, address)?;
+            let storage_keys = item.get::<JsArray, _, _>(&mut cx, "storageKeys").map(|v|{
+                let mut out = Vec::new();
+                let length = v.len(&mut cx);
+                for i in 0..length {
+                    let item = v.get::<>(&mut cx, i)?;
+                    let item = js_value_to_b256(&mut cx, item)?;
+                    out.push(item);
+                }
+                neon::result::NeonResult::Ok(out)
+            })??;
+            
+            out.push(AccessListItem {
+                address,
+                storage_keys: storage_keys
+            });
+        }
+        Some(AccessList(out))
+    } else {
+        None
+    };
     let from = js_value_to_address(&mut cx, from)?;
     let to = js_value_to_address(&mut cx, to)?;
     let data = js_value_to_bytes(&mut cx, data)?;
@@ -361,7 +404,8 @@ fn js_obj_tx_to_transaction<'a>(
         gas_limit,
         gas_price,
         gas_priority_fee,
-        max_fee_per_gas
+        max_fee_per_gas,
+        access_list
     })
 }
 
@@ -500,6 +544,12 @@ fn instantiate_run_tx<'a>(
                     _ => {}
                 }
             }
+
+            if let Some(list) = &tx.access_list {
+                if let Err(e) = app_state.cannonical.load_access_list(list).await {
+                    log::error!(target: LOGGER_TARGET_MAIN, "Failed to load access list {}", e);
+                };
+            };
 
             let mut db = db.lock_owned().await;
 
