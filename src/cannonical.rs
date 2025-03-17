@@ -248,6 +248,7 @@ impl CannonicalFork {
     }
 
     pub async fn reset_state(&self, block_number: u64) -> eyre::Result<()> {
+        log::info!(target: LOGGER_TARGET_SYNC, "reset_state({})", block_number);
         self.accounts.clear();
         self.storage.clear();
         self.block_hashes.clear();
@@ -330,18 +331,16 @@ impl CannonicalFork {
                     continue;
                 }
 
-                if let Some(table) = self.storage.get_async(&addr).await {
-                    let t = table.get();
-                    for (hpos, value) in v.storage {
-                        let pos: U256 = hpos.into();
-                        if !t.contains(&pos) {
-                            continue;
-                        }
-                        let value_to_insert: U256 = value.into();
+                let t = self.get_account_table(&addr).await;
+                for (hpos, value) in v.storage {
+                    let pos: U256 = hpos.into();
+                    if !t.contains(&pos) {
+                        continue;
+                    }
+                    let value_to_insert: U256 = value.into();
 
-                        if let scc::hash_index::Entry::Vacant(entry) = t.entry_async(pos).await {
-                            entry.insert_entry(StorageData::Live(value_to_insert));
-                        }
+                    if let scc::hash_index::Entry::Vacant(entry) = t.entry_async(pos).await {
+                        entry.insert_entry(StorageData::Live(value_to_insert));
                     }
                 }
             }
@@ -477,21 +476,19 @@ impl CannonicalFork {
                     continue;
                 }
 
-                if let Some(table) = self.storage.get_async(&addr).await {
-                    let t = table.get();
-                    for (index, value) in v.storage {
-                        let index: U256 = index.into();
-                        if !t.contains(&index) {
-                            continue;
-                        }
-                        let value_to_insert = match value {
-                            Delta::Added(value) => value,
-                            Delta::Changed(t) => t.to,
-                            _ => continue,
-                        };
-                        if let scc::hash_index::Entry::Vacant(entry) = t.entry_async(index).await {
-                            entry.insert_entry(StorageData::Live(value_to_insert.into()));
-                        }
+                let t = self.get_account_table(&addr).await;
+                for (index, value) in v.storage {
+                    let index: U256 = index.into();
+                    if !t.contains(&index) {
+                        continue;
+                    }
+                    let value_to_insert = match value {
+                        Delta::Added(value) => value,
+                        Delta::Changed(t) => t.to,
+                        _ => continue,
+                    };
+                    if let scc::hash_index::Entry::Vacant(entry) = t.entry_async(index).await {
+                        entry.insert_entry(StorageData::Live(value_to_insert.into()));
                     }
                 }
             }
@@ -551,7 +548,7 @@ impl CannonicalFork {
                 Some(self.code_by_hash(&acc.code_hash).await?)
             }
         } else {
-            let cell = match self.init_pending_account(&address) {
+            let cell = match self.init_pending_account(&address).await {
                 Ok(cell) => cell,
                 Err(_) => {
                     return match self.peek_account_info(&address).await.map(|v| v.code) {
@@ -771,20 +768,20 @@ impl CannonicalFork {
     ) -> eyre::Result<AccountInfo> {
         let info: AccountInfo = self.fetch_minimal_account_info(address, block_num).await?;
 
-        #[cfg(byte_code_analysis)]
-        if let Some(code) = &info.code {
-            let s = self.clone();
-            let first_acc_code = code.clone();
-            if perform_analysis {
-                tokio::spawn(async move {
-                    let code = first_acc_code;
-                    match s.run_new_account_analysis(address, code, block_num).await {
-                        Err(_) => return,
-                        Ok(accounts) => accounts,
-                    };
-                });
-            }
-        };
+        // #[cfg(byte_code_analysis)]
+        // if let Some(code) = &info.code {
+        //     let s = self.clone();
+        //     let first_acc_code = code.clone();
+        //     if perform_analysis {
+        //         tokio::spawn(async move {
+        //             let code = first_acc_code;
+        //             match s.run_new_account_analysis(address, code, block_num).await {
+        //                 Err(_) => return,
+        //                 Ok(accounts) => accounts,
+        //             };
+        //         });
+        //     }
+        // };
 
         Ok(info)
     }
@@ -914,7 +911,7 @@ impl CannonicalFork {
         log::info!(target: LOGGER_TARGET_SYNC, "load_positions: Will preload {} addresses", positions.len());
 
         for address in positions.iter() {
-            self.init_account_storage(*address);
+            self.get_account_table(*address).await;
         }
 
         let infos =
@@ -936,7 +933,7 @@ impl CannonicalFork {
                 if self.account_storage_value_initialized(addr, index).await {
                     continue;
                 }
-                self.init_account_storage_value(addr, index, value);
+                self.init_account_storage_value(addr, index, value).await;
             }
         }
         let mut new_addreses = HashSet::<Address>::new();
@@ -954,15 +951,26 @@ impl CannonicalFork {
     }
 
     #[inline]
-    fn init_pending_account(&self, address: &Address) -> eyre::Result<Arc<AsyncCell<AccountInfo>>> {
-        let cell: Arc<AsyncCell<AccountInfo>> = AsyncCell::shared();
-        if let Err(_) = self
-            .accounts
-            .insert(*address, AccountData::Pending(cell.clone()))
-        {
+    async fn init_pending_account(
+        &self,
+        address: &Address,
+    ) -> eyre::Result<Arc<AsyncCell<AccountInfo>>> {
+        if let Some(_) = self.accounts.peek_with(address, |_, _| true) {
             return Err(eyre::eyre!("Account already initialized"));
         }
-        Ok(cell)
+
+        log::trace!(target: LOGGER_TARGET_SYNC, "init_pending_account({})", address);
+        let out = match self.accounts.entry_async(*address).await {
+            scc::hash_index::Entry::Vacant(out) => {
+                let cell: Arc<AsyncCell<AccountInfo>> = AsyncCell::shared();
+                out.insert_entry(AccountData::Pending(cell.clone()));
+                eyre::Ok(cell)
+            }
+            _ => {
+                return Err(eyre::eyre!("Account already initialized"));
+            }
+        };
+        out
     }
 
     #[inline]
@@ -970,6 +978,7 @@ impl CannonicalFork {
         if self.contracts.contains(code_hash) {
             return Ok(());
         }
+        log::trace!(target: LOGGER_TARGET_SYNC, "insert_contract({})", code_hash);
         match self.contracts.entry_async(*code_hash).await {
             scc::hash_index::Entry::Vacant(out) => {
                 out.insert_entry(code);
@@ -981,8 +990,11 @@ impl CannonicalFork {
 
     #[inline]
     async fn code_by_hash(&self, code_hash: &B256) -> eyre::Result<Bytecode> {
-        if let Some(code) = self.contracts.get(code_hash) {
-            return Ok(code.clone());
+        if code_hash == &KECCAK_EMPTY {
+            return Ok(Bytecode::default());
+        }
+        if let Some(code) = self.contracts.peek_with(code_hash, |_, v| v.clone()) {
+            return Ok(code);
         }
         Ok(Bytecode::default())
     }
@@ -996,11 +1008,11 @@ impl CannonicalFork {
         if let Some(value) = self.peek_account_info(&address).await {
             return Ok(Some(value));
         }
-        let cell = match self.init_pending_account(&address) {
+        let cell = match self.init_pending_account(&address).await {
             Err(_) => return Ok(self.peek_account_info(&address).await),
             Ok(cell) => cell,
         };
-        self.init_account_storage(&address);
+        self.get_account_table(&address).await;
 
         log::trace!(target: LOGGER_TARGET_SYNC, "(Cache miss) Fetching account {}", address);
         let block_number: u64 = self.get_current_block();
@@ -1056,30 +1068,38 @@ impl CannonicalFork {
         false
     }
 
-    #[inline]
-    fn init_account_storage_value(&self, address: &Address, index: &U256, value: &U256) {
-        if let Err(_) = self
-            .storage
-            .get(address)
-            .unwrap()
-            .insert(*index, StorageData::Live(*value))
-        {
-            log::error!(target: LOGGER_TARGET_SYNC, "basic {}: Failed to insert storage at index {}", address, index);
-        }
+    async fn init_account_storage_value(&self, address: &Address, index: &U256, value: &U256) {
+        log::trace!(target: LOGGER_TARGET_SYNC, "init_account_storage_value({}, {})", address, index);
+
+        let storage = self.get_account_table(address).await;
+        if let Err(_) = storage.insert(*index, StorageData::Live(value.clone())) {}
     }
 
-    #[inline]
-    fn init_account_storage(&self, address: &Address) {
-        if self.storage.contains(address) {
-            return;
-        }
-        if let Err(_) = self.storage.insert(
-            *address,
-            scc::HashIndex::with_capacity_and_hasher(
+    async fn get_account_table(
+        &self,
+        address: &Address,
+    ) -> scc::hash_index::OccupiedEntry<
+        '_,
+        Address,
+        scc::hash_index::HashIndex<U256, StorageData, IndexHasher>,
+        FbBuildHasher<20>,
+    > {
+        let table = if self.storage.contains(address) {
+            self.storage.get_async(address).await.unwrap()
+        } else {
+            log::trace!(target: LOGGER_TARGET_SYNC, "init_account_storage({})", address);
+            let v = &scc::HashIndex::with_capacity_and_hasher(
                 DEFAULT_STORAGE_PR_ACCOUNT,
                 IndexHasher::default(),
-            ),
-        ) {}
+            );
+            if let Err(_) = self.storage.insert_async(*address, v.clone()).await {
+                self.storage.get_async(address).await.unwrap()
+            } else {
+                log::info!(target: LOGGER_TARGET_SYNC, "initialized storage for {}", address);
+                self.storage.get_async(address).await.unwrap()
+            }
+        };
+        return table;
     }
 
     async fn fetch_analyzed_slot(
@@ -1138,25 +1158,25 @@ impl CannonicalFork {
         index: U256,
         block_number: u64,
     ) -> eyre::Result<U256> {
+        log::trace!(target: LOGGER_TARGET_LOADS, "fetch_storage({}, {})", address, index);
         if let Ok(val) = self.peek_storage(&address, &index).await {
+            log::debug!(target: LOGGER_TARGET_LOADS, "cached fetch_storage({}, {})", address, index);
             return Ok(val);
         }
 
-        let cell = AsyncCell::shared();
-
-        match self
-            .storage
-            .get(&address)
-            .unwrap()
-            .insert(index, StorageData::Pending(cell.clone()))
+        let cell: Arc<AsyncCell<alloy::primitives::Uint<256, 4>>> = AsyncCell::shared();
         {
-            Err(_) => {
-                return self.peek_storage(&address, &index).await;
-            }
-            Ok(_) => {}
-        };
+            let storage = self.get_account_table(&address).await;
 
-        log::trace!(target: LOGGER_TARGET_LOADS, "get_storage_at({}, {})", address, index);
+            match storage.entry_async(index).await {
+                scc::hash_index::Entry::Vacant(out) => {
+                    out.insert_entry(StorageData::Pending(cell.clone()));
+                }
+                _ => return self.peek_storage(&address, &index).await,
+            };
+        }
+
+        log::debug!(target: LOGGER_TARGET_LOADS, "fetching storage ({}, {})", address, index);
         let data = self
             .provider
             .get_storage_at(address, index)
@@ -1165,8 +1185,28 @@ impl CannonicalFork {
             .wrap_err(format!(
                 "Failed to fetch storage for address {address} and index {index}"
             ))?;
+
         cell.set(data.clone());
-        Ok(data)
+
+        {
+            let storage = self.get_account_table(&address).await;
+            match storage.entry_async(index).await {
+                scc::hash_index::Entry::Vacant(out) => {
+                    out.insert_entry(StorageData::Live(data.clone()));
+                }
+                scc::hash_index::Entry::Occupied(out) => {
+                    match out.get() {
+                        StorageData::Pending(_) => {
+                            log::trace!(target: LOGGER_TARGET_LOADS, "updating storage ({}, {})", address, index);
+                            out.update(StorageData::Live(data.clone()));
+                        }
+                        _ => {}
+                    };
+                }
+            };
+        }
+
+        return Ok(data);
     }
 
     #[inline]
@@ -1175,11 +1215,10 @@ impl CannonicalFork {
             .storage
             .peek_with(address, |_, v| v.peek_with(index, |_, v| v.clone()))
         {
-            let value = match value {
-                StorageData::Live(data) => data.clone(),
-                StorageData::Pending(cell) => cell.get_shared().await.clone(),
-            };
-            return Ok(value);
+            match value {
+                StorageData::Live(data) => return Ok(data.into()),
+                StorageData::Pending(cell) => return Ok(cell.get_shared().await),
+            }
         }
         Err(eyre::eyre!("Storage not found"))
     }
