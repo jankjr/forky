@@ -7,7 +7,7 @@ if [ "$(uname)" == "Linux" ]; then
   fi
 
   # Install dependencies
-  apt-get install build-essential
-  apt-get install pkg-config
-  apt-get install libudev-dev
+  # apt-get install build-essential
+  # apt-get install pkg-config
+  # apt-get install libudev-dev
 fi
