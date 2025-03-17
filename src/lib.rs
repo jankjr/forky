@@ -1365,7 +1365,7 @@ pub fn main(mut cx: ModuleContext) -> NeonResult<()> {
     // if std::env::var_os("RUST_LOG").is_none() {
     //     std::env::set_var("RUST_LOG", "slot0=info");
     // }
-    log::set_max_level(log::LevelFilter::Debug);
+    // log::set_max_level(log::LevelFilter::Debug);
     pretty_env_logger::init();
 
     cx.export_function("createSimulator", create_simulator)?;

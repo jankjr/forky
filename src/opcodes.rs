@@ -1,5 +1,4 @@
 //! Output types for Operation and Opcode
-use eyre::{eyre, Result};
 use std::fmt;
 
 /// A single EVM operation

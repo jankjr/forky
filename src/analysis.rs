@@ -12,7 +12,7 @@ use revm::{
 
 use std::{
     borrow::BorrowMut,
-    collections::{hash_map::Entry, HashMap, HashSet},
+    collections::{hash_map::Entry, HashMap},
     fmt::{Debug, Display},
     hash::Hash,
     rc::Rc,
