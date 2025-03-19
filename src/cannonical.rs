@@ -339,8 +339,9 @@ impl CannonicalFork {
                     }
                     let value_to_insert: U256 = value.into();
 
-                    if let scc::hash_index::Entry::Vacant(entry) = t.entry_async(pos).await {
-                        entry.insert_entry(StorageData::Live(value_to_insert));
+                    if let scc::hash_index::Entry::Occupied(entry) = t.entry_async(pos).await {
+                        log::trace!(target: LOGGER_TARGET_SYNC, "{}.{} = {}", addr, pos, value_to_insert);
+                        entry.update(StorageData::Live(value_to_insert.into()));
                     }
                 }
             }
@@ -367,7 +368,9 @@ impl CannonicalFork {
             .await
             .wrap_err(format!("Failed to fetch trace for {}", block_number))?;
 
-        Ok(self.apply_next_reth_block(trace).await?)
+        self.apply_next_reth_block(trace).await?;
+        log::trace!(target: LOGGER_TARGET_SYNC, "applied reth block {}", block_number);
+        Ok(())
     }
 
     async fn load_geth_trace_and_apply(&self) -> eyre::Result<()> {
@@ -487,8 +490,9 @@ impl CannonicalFork {
                         Delta::Changed(t) => t.to,
                         _ => continue,
                     };
-                    if let scc::hash_index::Entry::Vacant(entry) = t.entry_async(index).await {
-                        entry.insert_entry(StorageData::Live(value_to_insert.into()));
+                    if let scc::hash_index::Entry::Occupied(entry) = t.entry_async(index).await {
+                        log::trace!(target: LOGGER_TARGET_SYNC, "{}.{} = {}", addr, index, value_to_insert);
+                        entry.update(StorageData::Live(value_to_insert.into()));
                     }
                 }
             }
