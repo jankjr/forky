@@ -51,6 +51,7 @@ pub const LOGGER_TARGET_SYNC: &str = "forky::sync";
 pub const LOGGER_TARGET_LOADS: &str = "forky::sync::loads";
 pub const LOGGER_TARGET_API: &str = "forky::api";
 pub const LOGGER_TARGET_SIMULATION: &str = "forky::sim";
+pub const LOGGER_TARGET_REFRESH: &str = "forky::refresh";
 
 #[derive(Debug, Clone)]
 pub struct TransactionRequest {
@@ -231,7 +232,12 @@ impl ApplicationState {
                 .apply_next_block(block)
                 .await?;
             current_syncced_block = block_number;
+
+            
         }
+        self.cannonical
+                .refresh_live_storage_values(self.cannonical.get_current_block())
+                .await?;
         Ok(())
     }
 }

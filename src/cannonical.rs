@@ -37,6 +37,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     future::IntoFuture,
     sync::Arc,
+    time::{self, Duration, SystemTime},
 };
 use tokio::runtime::Handle;
 
@@ -45,7 +46,7 @@ use crate::{
     analysis::{perform_analysis, AnalysisContext, AnalyzedStoragesSlot},
     config::LinkType,
     utils::is_address_like,
-    LOGGER_TARGET_LOADS, LOGGER_TARGET_SYNC,
+    LOGGER_TARGET_LOADS, LOGGER_TARGET_REFRESH, LOGGER_TARGET_SYNC,
 };
 
 // type AddressHasher = hash_hasher::HashBuildHasher;
@@ -71,9 +72,11 @@ static ADMIN_SLOT: U256 = U256::from_be_bytes(hex!(
     "10d6a54a4754c8869d6886b5f5d7fbfa5b4522237ea5c60d11bc4e7a1ff9390b"
 ));
 
-static SLOTS_TO_FETCH_ON_RUNNING: usize = 2;
-static SLOTS_TO_FETCH_PREFETCH: usize = 5;
+static SLOTS_TO_FETCH_ON_RUNNING: usize = 1;
+static SLOTS_TO_FETCH_PREFETCH: usize = 1;
 static MAX_ARRAY_ENTRIES_TO_PRELOAD: usize = 100;
+static MAX_STORAGE_AGE: u64 = 30;
+static MAX_ENTRIES_TO_REFRESH: usize = 2048;
 
 impl Forked {
     // pub fn set_dry_run(&mut self, dry_run: bool) {
@@ -190,8 +193,40 @@ enum AccountData {
 
 #[derive(Debug, Clone)]
 enum StorageData {
-    Pending(Arc<AsyncCell<U256>>),
-    Live(U256),
+    Pending(Arc<AsyncCell<U256>>, u64),
+    Live(U256, u64),
+}
+
+impl StorageData {
+    pub fn live(value: U256) -> Self {
+        Self::Live(
+            value,
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or(Duration::from_secs(0))
+                .as_secs(),
+        )
+    }
+    pub fn pending(value: Arc<AsyncCell<U256>>) -> Self {
+        Self::Pending(
+            value,
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or(Duration::from_secs(0))
+                .as_secs(),
+        )
+    }
+
+    pub fn age(&self) -> u64 {
+        let current_time = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs();
+        match self {
+            Self::Live(_, age) => current_time - *age,
+            Self::Pending(_, age) => current_time - *age,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -341,7 +376,7 @@ impl CannonicalFork {
 
                     if let scc::hash_index::Entry::Occupied(entry) = t.entry_async(pos).await {
                         log::trace!(target: LOGGER_TARGET_SYNC, "{}.{} = {}", addr, pos, value_to_insert);
-                        entry.update(StorageData::Live(value_to_insert.into()));
+                        entry.update(StorageData::live(value_to_insert.into()));
                     }
                 }
             }
@@ -417,6 +452,56 @@ impl CannonicalFork {
         self.apply_next_geth_block(diffs).await
     }
 
+    pub async fn refresh_live_storage_values(&self, block_num: u64) -> eyre::Result<()> {
+        let mut to_refresh = Vec::<(Address, U256)>::new();
+        let mut oldest = 0;
+        let mut entries_iterated = 0;
+        {
+            let outer_guard = Guard::new();
+
+            for (addr, storage) in self.storage.iter(&outer_guard) {
+                if to_refresh.len() > MAX_ENTRIES_TO_REFRESH {
+                    break;
+                }
+                let inner_guard = Guard::new();
+                for (index, value) in storage.iter(&inner_guard) {
+                    entries_iterated += 1;
+                    if to_refresh.len() > MAX_ENTRIES_TO_REFRESH {
+                        break;
+                    }
+                    let age = value.age();
+                    if age > oldest {
+                        oldest = age;
+                    }
+                    if age < MAX_STORAGE_AGE {
+                        continue;
+                    }
+                    to_refresh.push((*addr, *index));
+                }
+            }
+        }
+
+        if !to_refresh.is_empty() {
+            log::debug!(target: LOGGER_TARGET_REFRESH, "Refreshing {} storage values. Total entries in storage: {}", to_refresh.len(), entries_iterated);
+            let new_values = self.load_slots(to_refresh, block_num).await?;
+
+            for (address, index, value) in new_values {
+                if let scc::hash_index::Entry::Occupied(entry) = self
+                    .get_account_table(&address)
+                    .await
+                    .entry_async(index)
+                    .await
+                {
+                    entry.update(StorageData::live(value));
+                }
+            }
+        } else {
+            log::debug!(target: LOGGER_TARGET_REFRESH, "No storage values to refresh, oldest entry is {} seconds old. Total entries in storage: {}", oldest, entries_iterated);
+        }
+
+        Ok(())
+    }
+
     pub async fn apply_next_block(&self, block: Block) -> eyre::Result<()> {
         self.current_block.swap(
             (Some(Shared::new(block)), Tag::None),
@@ -427,6 +512,7 @@ impl CannonicalFork {
         } else {
             self.load_geth_trace_and_apply().await?
         };
+
         Ok(())
     }
     async fn apply_next_reth_block(
@@ -492,7 +578,7 @@ impl CannonicalFork {
                     };
                     if let scc::hash_index::Entry::Occupied(entry) = t.entry_async(index).await {
                         log::trace!(target: LOGGER_TARGET_SYNC, "{}.{} = {}", addr, index, value_to_insert);
-                        entry.update(StorageData::Live(value_to_insert.into()));
+                        entry.update(StorageData::live(value_to_insert.into()));
                     }
                 }
             }
@@ -531,6 +617,39 @@ impl CannonicalFork {
             })
             .map(|v| match v {
                 Ok((index, Ok(value))) => Ok((index, value)),
+                e => Err(eyre::eyre!("Failed to fetch storage {:?}", e)),
+            })
+        });
+
+        let out = try_join_all(futs).await?;
+        Ok(out)
+    }
+
+    #[inline]
+    async fn load_slots(
+        &self,
+        slots: Vec<(Address, U256)>,
+        block_num: u64,
+    ) -> eyre::Result<Vec<(Address, U256, U256)>> {
+        let provider = self.provider.clone();
+        let futs = slots.into_iter().map(|(address, offset)| {
+            let offset = offset.clone();
+            let provider = provider.clone();
+            tokio::spawn(async move {
+                let offset = offset.clone();
+                let provider = provider.clone();
+
+                return (
+                    address,
+                    offset,
+                    provider
+                        .get_storage_at(address, offset)
+                        .block_id(BlockId::from(block_num))
+                        .await,
+                );
+            })
+            .map(|v| match v {
+                Ok((address, index, Ok(value))) => Ok((address, index, value)),
                 e => Err(eyre::eyre!("Failed to fetch storage {:?}", e)),
             })
         });
@@ -1076,7 +1195,7 @@ impl CannonicalFork {
         log::trace!(target: LOGGER_TARGET_SYNC, "init_account_storage_value({}, {})", address, index);
 
         let storage = self.get_account_table(address).await;
-        if let Err(_) = storage.insert(*index, StorageData::Live(value.clone())) {}
+        if let Err(_) = storage.insert(*index, StorageData::live(value.clone())) {}
     }
 
     async fn get_account_table(
@@ -1174,7 +1293,7 @@ impl CannonicalFork {
 
             match storage.entry_async(index).await {
                 scc::hash_index::Entry::Vacant(out) => {
-                    out.insert_entry(StorageData::Pending(cell.clone()));
+                    out.insert_entry(StorageData::pending(cell.clone()));
                 }
                 _ => return self.peek_storage(&address, &index).await,
             };
@@ -1196,13 +1315,13 @@ impl CannonicalFork {
             let storage = self.get_account_table(&address).await;
             match storage.entry_async(index).await {
                 scc::hash_index::Entry::Vacant(out) => {
-                    out.insert_entry(StorageData::Live(data.clone()));
+                    out.insert_entry(StorageData::live(data.clone()));
                 }
                 scc::hash_index::Entry::Occupied(out) => {
                     match out.get() {
-                        StorageData::Pending(_) => {
+                        StorageData::Pending(_, _) => {
                             log::trace!(target: LOGGER_TARGET_LOADS, "updating storage ({}, {})", address, index);
-                            out.update(StorageData::Live(data.clone()));
+                            out.update(StorageData::live(data.clone()));
                         }
                         _ => {}
                     };
@@ -1220,8 +1339,8 @@ impl CannonicalFork {
             .peek_with(address, |_, v| v.peek_with(index, |_, v| v.clone()))
         {
             match value {
-                StorageData::Live(data) => return Ok(data.into()),
-                StorageData::Pending(cell) => return Ok(cell.get_shared().await),
+                StorageData::Live(data, _) => return Ok(data.into()),
+                StorageData::Pending(cell, _) => return Ok(cell.get_shared().await),
             }
         }
         Err(eyre::eyre!("Storage not found"))
