@@ -735,7 +735,7 @@ impl CannonicalFork {
             (U256::from(0), Bytes::new())
         } else {
             log::trace!(target: LOGGER_TARGET_LOADS, "fetch_minimal_account_info({})", address);
-            futures::try_join!(
+            let out = futures::try_join!(
                 provider
                     .get_balance(address)
                     .block_id(block_id)
@@ -745,7 +745,10 @@ impl CannonicalFork {
                     .block_id(block_id)
                     .into_future(),
             )
-            .wrap_err("Failed to fetch account info")?
+            .wrap_err("Failed to fetch account info")?;
+
+            log::trace!(target: LOGGER_TARGET_LOADS, "fetch_minimal_account_info({}) DONE", address);
+            out
         };
 
         let code_hash = if code.is_empty() {
@@ -1016,7 +1019,6 @@ impl CannonicalFork {
             Err(_) => return Ok(self.peek_account_info(&address).await),
             Ok(cell) => cell,
         };
-        self.get_account_table(&address).await;
 
         log::trace!(target: LOGGER_TARGET_SYNC, "(Cache miss) Fetching account {}", address);
         let block_number: u64 = self.get_current_block();
@@ -1096,12 +1098,14 @@ impl CannonicalFork {
                 DEFAULT_STORAGE_PR_ACCOUNT,
                 IndexHasher::default(),
             );
-            if let Err(_) = self.storage.insert_async(*address, v.clone()).await {
-                self.storage.get_async(address).await.unwrap()
-            } else {
-                log::info!(target: LOGGER_TARGET_SYNC, "initialized storage for {}", address);
-                self.storage.get_async(address).await.unwrap()
+            match self.storage.entry_async(*address).await {
+                scc::hash_index::Entry::Vacant(out) => {
+                    out.insert_entry(v.clone());
+                }
+                _ => {}
             }
+
+            return self.storage.get_async(address).await.unwrap();
         };
         return table;
     }
@@ -1191,24 +1195,6 @@ impl CannonicalFork {
             ))?;
 
         cell.set(data.clone());
-
-        {
-            let storage = self.get_account_table(&address).await;
-            match storage.entry_async(index).await {
-                scc::hash_index::Entry::Vacant(out) => {
-                    out.insert_entry(StorageData::Live(data.clone()));
-                }
-                scc::hash_index::Entry::Occupied(out) => {
-                    match out.get() {
-                        StorageData::Pending(_) => {
-                            log::trace!(target: LOGGER_TARGET_LOADS, "updating storage ({}, {})", address, index);
-                            out.update(StorageData::Live(data.clone()));
-                        }
-                        _ => {}
-                    };
-                }
-            };
-        }
 
         return Ok(data);
     }
