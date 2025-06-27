@@ -1,11 +1,25 @@
 use alloy::eips::BlockId;
 use alloy::hex::FromHex;
-use alloy::transports::BoxTransport;
+use alloy::rpc::types::AccessList;
 
+use alloy::rpc::types::AccessListItem;
+use alloy_provider::DynProvider;
 use alloy_provider::Provider;
 use neon::prelude::Context;
-use revm::primitives::AccessList;
-use revm::primitives::AccessListItem;
+use revm::context::result::ExecutionResult;
+use revm::context::TxEnv;
+use revm::interpreter::interpreter_types::InputsTr;
+use revm::interpreter::interpreter_types::Jumps;
+use revm::interpreter::Interpreter;
+use revm::interpreter::InterpreterTypes;
+use revm::primitives::Bytes;
+use revm::primitives::FixedBytes;
+use revm::primitives::Log;
+use revm::state::Bytecode;
+use revm::ExecuteEvm;
+use revm::InspectEvm;
+use revm::MainBuilder;
+use revm::MainContext;
 use scc::hash_set::HashSet;
 use eyre::ContextCompat;
 use eyre::Ok;
@@ -18,12 +32,11 @@ use neon::types::JsUndefined;
 use neon::types::Value;
 use neon::types::{JsBigInt, JsFunction, JsNumber, JsObject, JsPromise, JsString, JsValue};
 
-use revm::db::CacheDB;
-use revm::primitives::ExecutionResult;
+use revm::database::CacheDB;
 use revm::primitives::U256;
-use revm::primitives::{hex, TransactTo};
+use revm::primitives::{hex};
 use revm::DatabaseRef;
-use revm::{primitives::Address, Evm};
+use revm::{primitives::Address};
 
 use once_cell::sync::OnceCell;
 use utils::provider_from_string;
@@ -34,10 +47,6 @@ use std::ops::DerefMut;
 use std::{str::FromStr, sync::Arc};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
-mod analysis;
-mod abstract_value;
-mod abstract_stack;
-mod opcodes;
 pub mod utils;
 pub mod cannonical;
 pub mod config;
@@ -68,8 +77,7 @@ pub struct TransactionRequest {
 pub struct ApplicationState {
     pub cannonical: Arc<CannonicalFork>,
     pub preload: Arc<HashSet<Address>>,
-    pub provider: alloy::providers::RootProvider<BoxTransport>,
-    pub provider_trace: alloy::providers::RootProvider<BoxTransport>,
+    pub provider: DynProvider,
     pub config: Config,
 }
 
@@ -104,15 +112,14 @@ const DEFAULT_SLOTS: [revm::primitives::U256; 3] = [
 impl ApplicationState {
     pub async fn create(
         config: Config,
-        provider: alloy::providers::RootProvider<BoxTransport>,
-        provider_trace: alloy::providers::RootProvider<BoxTransport>,
+        provider: DynProvider,
     ) -> eyre::Result<Self> {
         use eyre::WrapErr;
 
         let forking_from = config.start_block.map(|b|BlockId::from(b)).unwrap_or(BlockId::latest());
         log::debug!(target: LOGGER_TARGET_SYNC, "Creating cannonical fork. Start block {}", forking_from);
         let fork_block = provider
-            .get_block(forking_from, alloy::rpc::types::BlockTransactionsKind::Hashes)
+            .get_block(forking_from)
             .await
             .wrap_err("Failed to fetch latest block")?
             .wrap_err("Network contains no blocks")?;
@@ -120,13 +127,11 @@ impl ApplicationState {
         let out = Self {
             cannonical: Arc::new(CannonicalFork::new(
                 provider.clone(),
-                provider_trace.clone(),
                 fork_block,
                 config.clone(),
             )),
             preload: Arc::new(HashSet::new()),
             provider: provider.clone(),
-            provider_trace: provider_trace.clone(),
             config,
         };
 
@@ -146,7 +151,7 @@ impl ApplicationState {
         let block_env = reader.block_env();
 
         let out = Arc::new(Mutex::new(ActiveFork {
-            db: revm::db::CacheDB::<Forked>::new(Forked {
+            db: CacheDB::<Forked>::new(Forked {
                 cannonical: reader,
                 env: block_env,
                 seconds_per_block: U256::from(self.config.seconds_per_block)
@@ -222,7 +227,7 @@ impl ApplicationState {
             let block_number: u64 = current_syncced_block + 1;
             let block = self
                 .provider
-                .get_block(BlockId::Number(alloy::eips::BlockNumberOrTag::Number(block_number)), alloy::rpc::types::BlockTransactionsKind::Hashes)
+                .get_block(BlockId::Number(alloy::eips::BlockNumberOrTag::Number(block_number)))
                 .await?
                 .wrap_err(format!("Failed to fetch block {block_number} from RPC"))?;
 
@@ -278,11 +283,9 @@ async fn init_application_state(config: Config) -> eyre::Result<ApplicationState
     use eyre::WrapErr;
     
 
-
     let provider = provider_from_string(&config.fork_url).await?;
-    let trace_provider = provider_from_string(&config.trace_fork_url).await?;
 
-    let app_state = ApplicationState::create(config, provider, trace_provider)
+    let app_state = ApplicationState::create(config, provider)
         .await
         .wrap_err("Failed to create application state")?;
 
@@ -410,10 +413,10 @@ fn js_obj_tx_to_transaction<'a>(
 }
 
 struct LogTracer {
-    pub memory_reads: HashMap<revm::primitives::Address, std::collections::HashSet<revm::primitives::U256>>,
+    pub memory_reads: HashMap<Address, std::collections::HashSet<U256>>,
     pub logs: Vec<(
-        revm::primitives::Address,
-        Vec<revm::primitives::FixedBytes<32>>,
+        Address,
+        Vec<FixedBytes<32>>,
         Vec<u8>,
     )>,
 }
@@ -434,7 +437,7 @@ impl LogTracer {
             .map(|f| {
                 (
                     f.0.clone(),
-                    f.1.clone().into_iter().map(|v| v.clone()).collect(),
+                    f.1.iter().map(|v| v.clone()).collect(),
                 )
             })
             .collect()
@@ -442,41 +445,13 @@ impl LogTracer {
 }
 
 
-impl revm::Inspector<&mut CacheDB<Forked>> for LogTracer {
-    fn step_end(
-        &mut self,
-        interp: &mut revm::interpreter::Interpreter,
-        _: &mut revm::EvmContext<&mut CacheDB<Forked>>,
-    ) {
-        let opcode: u8 = interp.current_opcode();
-        if opcode == 0x54 {
-            let address = interp.contract().target_address;
-            let loc = interp.stack.peek(0).unwrap_or_default();
-            if DEFAULT_SLOTS.contains(&loc) {
-                return;
-            }
-            self.memory_reads
-                .entry(address)
-                .and_modify(|set| {
-                    set.insert(loc);
-                })
-                .or_insert(std::collections::HashSet::from_iter(vec![loc]));
-            return;
-        }
-    }
-    // fn call(&mut self, context: &mut revm::EvmContext<&mut  CacheDB<Forked>> ,inputs: &mut revm::interpreter::CallInputs,) -> Option<revm::interpreter::CallOutcome> {
-    //     for slot in context.db.db.cannonical.call(inputs) {
-    //         if let Err(e) = context.db.storage_ref(inputs.target_address, slot) {
-    //             log::error!(target: LOGGER_TARGET_MAIN, "Failed to fetch storage for {}: {:?}", inputs.target_address, e);
-    //         }
-    //     }
-    //     return None;
-    // }
+impl<CTX, INTR: InterpreterTypes> revm::Inspector<CTX, INTR> for LogTracer {
+    #[inline]
     fn log(
         &mut self,
-        _: &mut revm::interpreter::Interpreter,
-        _context: &mut revm::EvmContext<&mut CacheDB<Forked>>,
-        log: &revm::primitives::Log,
+        _: &mut Interpreter<INTR>,
+        _context: &mut CTX,
+        log: alloy::primitives::Log
     ) {
         let address = log.address;
         let payload = log.data.data.to_vec();
@@ -488,7 +463,7 @@ impl revm::Inspector<&mut CacheDB<Forked>> for LogTracer {
 fn instantiate_js_log<'a>(
     context: &mut TaskContext<'a>,
     addr: Address,
-    topics: Vec<revm::primitives::FixedBytes<32>>,
+    topics: Vec<FixedBytes<32>>,
     data: Vec<u8>,
 ) -> JsResult<'a, JsObject> {
     let js_log = context.empty_object();
@@ -563,57 +538,39 @@ fn instantiate_run_tx<'a>(
             let result = {
                 let start_time = std::time::Instant::now();
 
-                let tracer = LogTracer::new();
+                
 
                 let block_env = active_fork.db.db.env.clone();
-                let gas_limit = tx.gas_limit.unwrap_or(block_env.gas_limit);
+                let gas_limit = tx.gas_limit.unwrap_or(U256::from(block_env.gas_limit));
                 let inner_db =  active_fork.db.borrow_mut();
-                let out: Evm<'_, LogTracer, &mut CacheDB<Forked>> = revm::Evm::builder()
-                    .with_block_env(block_env.clone())
+                let mut simulation_runner = revm::Context::mainnet()
+                    .with_block(block_env.clone())
                     .with_db(inner_db)
-                    .modify_cfg_env(|f|{
+                    .modify_cfg_chained(|f|{
                         f.memory_limit = 1024 * 1024 * 64;
                         f.disable_eip3607 = true;
                         f.disable_balance_check = !commit;
                     })
-                    .with_external_context(tracer)
-                    .append_handler_register(revm::inspector_handle_register)
-                    .with_spec_id(revm::primitives::SpecId::CANCUN)
-                    .build();
-                let mut simulation_runner = out
-                    .modify()
-                    .modify_tx_env(|tx_env| {
-                        let tx = tx.clone();
-                        tx_env.caller = tx.from;
-                        if !tx.data.is_empty() {
-                            tx_env.data = revm::primitives::Bytes::from(tx.data);
-                        }
-                        tx_env.value = tx.value;
-                        tx_env.gas_limit = gas_limit.to();
-                        
-                        tx_env.gas_priority_fee = tx.gas_priority_fee;
+                    .build_mainnet_with_inspector(LogTracer::new());
 
-                        if let Some(v) = tx.gas_price {
-                            tx_env.gas_price = v
-                        }
-                        match tx.gas_price {
-                            Some(v) => tx_env.gas_price = v,
-                            None => {
-                                tx_env.gas_price = block_env.basefee + U256::from(1u64);
-                            }
-                        };
-                        
-                        tx_env.transact_to = TransactTo::Call(tx.to);
-                    })
-                    .build();
-                
-                let result = simulation_runner.transact_commit();
+
+                let tx = TxEnv::builder()
+                .caller(tx.from)
+                .to(tx.to)
+                .data(Bytes::from(tx.data))
+                .value(tx.value)
+                .gas_limit(gas_limit.to())
+                .gas_price(tx.gas_price.map(|i|i.to()).unwrap_or(block_env.basefee as u128 + 1u128))
+                .build()
+                .unwrap();
+
+                let result = simulation_runner.inspect(tx.clone(), LogTracer::new());
 
                 let end_time = std::time::Instant::now();
                 log::info!(target: LOGGER_TARGET_MAIN, "Simulation took {:?}", end_time - start_time);
 
                 match result {
-                    std::result::Result::Err(e) => {
+                    Result::Err(e) => {
                         log::error!(target: LOGGER_TARGET_MAIN, "EVM error: {}", e);
                         deferred.settle_with(&channel, move |mut cx: TaskContext<'_>| {
                             let err = cx.error(e.to_string())?;
@@ -621,8 +578,8 @@ fn instantiate_run_tx<'a>(
                         });
                         return;
                     }
-                    std::result::Result::Ok(v) => {
-                        match &v {
+                    Result::Ok(v) => {
+                        match &v.result {
                             ExecutionResult::Revert { gas_used, output } => {
                                 log::debug!(target: LOGGER_TARGET_MAIN, "Simulation reverted with error {} gas used {}", output, gas_used);
 
@@ -632,11 +589,11 @@ fn instantiate_run_tx<'a>(
                             }
                             _ => {}
                         };
-                        let logs = simulation_runner.context.external.logs.clone();
+                        let tracer = simulation_runner.into_inspector();
                         (
                             v,
-                            logs,
-                            simulation_runner.context.external.collect_memory_reads(),
+                            tracer.logs.clone(),
+                            tracer.collect_memory_reads(),
                         )
                     }
                 }
@@ -655,12 +612,12 @@ fn instantiate_run_tx<'a>(
             };
 
             let (res, logs, reads) = result;
-
+            
 
             let res = (
-                res.output().unwrap_or_default().to_vec(),
-                res.gas_used(),
-                res.into_logs(),
+                res.result.output().unwrap_or_default().to_vec(),
+                res.result.gas_used(),
+                res.result.into_logs(),
                 reads,
             );
 
@@ -763,7 +720,7 @@ fn instantiate_run_tx<'a>(
 }
 
 fn instantiate_checkpoint_fn<'a>(
-    cx: &mut TaskContext<'a>, // evm: Arc<Evm<'a,(), CacheDB<Forked>>>,
+    cx: &mut TaskContext<'a>,
     db: ActiveForkRef,
 ) -> JsResult<'a, JsFunction> {
     let db = db.clone();
@@ -783,7 +740,7 @@ fn instantiate_checkpoint_fn<'a>(
     })
 }
 fn instantiate_revert_to_fn<'a>(
-    cx: &mut TaskContext<'a>, // evm: Arc<Evm<'a,(), CacheDB<Forked>>>,
+    cx: &mut TaskContext<'a>,
     db: ActiveForkRef,
 ) -> JsResult<'a, JsFunction> {
     let db = db.clone();
@@ -809,7 +766,7 @@ fn instantiate_revert_to_fn<'a>(
 }
 
 fn instantiate_mine_fn<'a>(
-    cx: &mut TaskContext<'a>, // evm: Arc<Evm<'a,(), CacheDB<Forked>>>,
+    cx: &mut TaskContext<'a>,
     db: ActiveForkRef,
 ) -> JsResult<'a, JsFunction> {
     let db = db.clone();
@@ -841,7 +798,7 @@ fn instantiate_mine_fn<'a>(
 }
 
 fn instantiate_get_block_number_fn<'a>(
-    cx: &mut TaskContext<'a>, // evm: Arc<Evm<'a,(), CacheDB<Forked>>>,
+    cx: &mut TaskContext<'a>,
     db: ActiveForkRef,
 ) -> JsResult<'a, JsFunction> {
     let db = db.clone();
@@ -863,7 +820,7 @@ fn instantiate_get_block_number_fn<'a>(
 }
 
 fn instantiate_get_timestamp_fn<'a>(
-    cx: &mut TaskContext<'a>, // evm: Arc<Evm<'a,(), CacheDB<Forked>>>,
+    cx: &mut TaskContext<'a>,
     db: ActiveForkRef,
 ) -> JsResult<'a, JsFunction> {
     let db = db.clone();
@@ -885,7 +842,7 @@ fn instantiate_get_timestamp_fn<'a>(
 }
 
 fn instantiate_set_timestamp_fn<'a>(
-    cx: &mut TaskContext<'a>, // evm: Arc<Evm<'a,(), CacheDB<Forked>>>,
+    cx: &mut TaskContext<'a>,
     db: ActiveForkRef,
 ) -> JsResult<'a, JsFunction> {
     let db = db.clone();
@@ -916,7 +873,7 @@ fn instantiate_set_timestamp_fn<'a>(
 }
 
 fn instantiate_set_balance_fn<'a>(
-    cx: &mut TaskContext<'a>, // evm: Arc<Evm<'a,(), CacheDB<Forked>>>,
+    cx: &mut TaskContext<'a>,
     db: ActiveForkRef,
 ) -> JsResult<'a, JsFunction> {
     let db = db.clone();
@@ -935,7 +892,8 @@ fn instantiate_set_balance_fn<'a>(
             let acc = forked
                 .db
                 .load_account(address)
-                .map(|v| v.info.balance = new_balance);
+                .map(|v| v.info.balance = new_balance)
+                .map_err(|i|i.into());
 
             deferred.settle_with(&channel, move |mut cx: TaskContext| {
                 to_neon(&mut cx, acc)?;
@@ -948,7 +906,7 @@ fn instantiate_set_balance_fn<'a>(
 }
 
 fn instantiate_get_balance_fn<'a>(
-    cx: &mut TaskContext<'a>, // evm: Arc<Evm<'a,(), CacheDB<Forked>>>,
+    cx: &mut TaskContext<'a>,
     db: ActiveForkRef,
 ) -> JsResult<'a, JsFunction> {
     let db = db.clone();
@@ -962,7 +920,7 @@ fn instantiate_get_balance_fn<'a>(
         let (deferred, promise) = cx.promise();
         runtime(&mut cx)?.spawn(async move {
             let mut forked = db.lock().await;
-            let acc = forked.db.load_account(address).map(|v| v.info.balance);
+            let acc = forked.db.load_account(address).map(|v| v.info.balance).map_err(|i|i.into());
             deferred.settle_with(&channel, move |mut cx: TaskContext| {
                 let acc  = to_neon(&mut cx, acc)?;
                 
@@ -978,7 +936,7 @@ fn instantiate_get_balance_fn<'a>(
 
 
 fn instantiate_get_storage_at_fn<'a>(
-    cx: &mut TaskContext<'a>, // evm: Arc<Evm<'a,(), CacheDB<Forked>>>,
+    cx: &mut TaskContext<'a>,
     db: ActiveForkRef,
 ) -> JsResult<'a, JsFunction> {
     let db = db.clone();
@@ -994,7 +952,7 @@ fn instantiate_get_storage_at_fn<'a>(
         let (deferred, promise) = cx.promise();
         runtime(&mut cx)?.spawn(async move {
             let forked = db.lock().await;
-            let value = forked.db.storage_ref(address, position);
+            let value = forked.db.storage_ref(address, position).map_err(|i|i.into());
             deferred.settle_with(&channel, move |mut cx: TaskContext| {
                 let acc  = to_neon(&mut cx, value)?;
                 
@@ -1009,7 +967,7 @@ fn instantiate_get_storage_at_fn<'a>(
 }
 
 fn init_preload_addr_fn<'a>(
-    cx: &mut TaskContext<'a>, // evm: Arc<Evm<'a,(), CacheDB<Forked>>>,
+    cx: &mut TaskContext<'a>,
     db: ActiveForkRef,
 ) -> JsResult<'a, JsFunction> {
     let db = db.clone();
@@ -1085,18 +1043,10 @@ fn create_preload_fn<'a>(
     })
 }
 
-// fn instantiate_reset_fn<'a>(
-//     cx: &mut TaskContext<'a>,
-//     state: ApplicationStateRef,
-// ) -> JsResult<'a, JsFunction> {
-//     JsFunction::new(cx, move |mut cx: FunctionContext| {
-//         let state = state.clone();
-//     })
-// }
 
 
 fn instantiate_set_storage_fn<'a>(
-    cx: &mut TaskContext<'a>, // evm: Arc<Evm<'a,(), CacheDB<Forked>>>,
+    cx: &mut TaskContext<'a>,
     db: ActiveForkRef,
 ) -> JsResult<'a, JsFunction> {
     let db: ActiveForkRef = db.clone();
@@ -1116,7 +1066,7 @@ fn instantiate_set_storage_fn<'a>(
         runtime(&mut cx)?.spawn(async move {
             let mut forked = db.clone().lock_owned().await;
             if let Err(_) = forked.db.db.cannonical.get_account_data(&address).await {}
-            let acc = forked.db.insert_account_storage(address, key, new_value);
+            let acc = forked.db.insert_account_storage(address, key, new_value).map_err(|i|i.into());
 
             deferred.settle_with(&channel, move |mut cx: TaskContext| {
                 to_neon(&mut cx, acc)?;
@@ -1129,7 +1079,7 @@ fn instantiate_set_storage_fn<'a>(
 }
 
 fn instantiate_set_code_fn<'a>(
-    cx: &mut TaskContext<'a>, // evm: Arc<Evm<'a,(), CacheDB<Forked>>>,
+    cx: &mut TaskContext<'a>,
     db: ActiveForkRef,
 ) -> JsResult<'a, JsFunction> {
     use eyre::WrapErr;
@@ -1150,7 +1100,7 @@ fn instantiate_set_code_fn<'a>(
         let code = if code.len() == 0 {
             None
         } else {
-            let code = revm::primitives::Bytecode::new_raw(code);
+            let code = Bytecode::new_raw(code);
 
             Some(code)
         };
@@ -1158,7 +1108,7 @@ fn instantiate_set_code_fn<'a>(
         let (deferred, promise) = cx.promise();
         runtime(&mut cx)?.spawn(async move {
             let mut forked = db.clone().lock_owned().await;
-            let acc = forked.db.load_account(address).map(|v| v.info.code = code);
+            let acc = forked.db.load_account(address).map(|v| v.info.code = code).map_err(|i|i.into());
             log::info!(target: LOGGER_TARGET_MAIN, "Account code set");
             deferred.settle_with(&channel, move |mut cx: TaskContext| {
                 to_neon(&mut cx, acc)?;
@@ -1171,7 +1121,7 @@ fn instantiate_set_code_fn<'a>(
 }
 
 fn init_fork_js_obj<'a>(
-    cx: &mut TaskContext<'a>, // evm: Arc<Evm<'a,(), CacheDB<Forked>>>,
+    cx: &mut TaskContext<'a>,
     app_state: ApplicationStateRef,
     db: ActiveForkRef,
 ) -> JsResult<'a, JsObject> {
@@ -1291,8 +1241,8 @@ fn create_on_block_fn<'a>(
 fn create_simulator(mut cx: FunctionContext) -> JsResult<JsPromise> {
     let fork_url = cx.argument::<JsString>(0)?.value(&mut cx);
     let link: Result<LinkType, eyre::Error> = LinkType::from_str(cx.argument::<JsString>(1)?.value(&mut cx).as_str());
-    let (seconds_per_block, start_block, trace_fork_url, max_blocks_behind) = match cx.argument_opt(2) {
-        None => (12u64, None, fork_url.clone(), 50u64),
+    let (seconds_per_block, start_block, max_blocks_behind) = match cx.argument_opt(2) {
+        None => (12u64, None, 50u64),
         Some(obj) => {
             let opts = obj.downcast_or_throw::<JsObject, FunctionContext>(&mut cx)?;
             let seconds_pr_block = opts.get_opt(&mut cx, "secondsPerBlock")?.unwrap_or(cx.number(12u32)).downcast_or_throw::<JsNumber, FunctionContext>(&mut cx)?.value(&mut cx) as u64;
@@ -1306,20 +1256,14 @@ fn create_simulator(mut cx: FunctionContext) -> JsResult<JsPromise> {
             } else {
                 None
             };
-            let trace_provider_url = if let Some(val) = opts.get_opt::<JsString, FunctionContext, _>(&mut cx, "traceProvider")? {
-                val.downcast_or_throw::<JsString, FunctionContext>(&mut cx)?.value(&mut cx)
-            } else {
-                fork_url.clone()
-            };
             let max_blocks_behind = opts.get_opt(&mut cx, "maxBlocksBehind")?.unwrap_or(cx.number(50u32)).downcast_or_throw::<JsNumber, FunctionContext>(&mut cx)?.value(&mut cx) as u64;
             
-            (seconds_pr_block, fork_block_number, trace_provider_url, max_blocks_behind)
+            (seconds_pr_block, fork_block_number, max_blocks_behind)
         }
     };
 
     let config = Config {
         fork_url,
-        trace_fork_url,
         seconds_per_block,
         link_type: to_neon(&mut cx, link)?,
         start_block,

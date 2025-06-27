@@ -2,7 +2,6 @@
 pub struct Config {
     pub link_type: LinkType,
     pub fork_url: String,
-    pub trace_fork_url: String,
     pub seconds_per_block: u64,
     pub start_block: Option<u64>,
     pub max_blocks_behind: u64,
@@ -21,9 +20,7 @@ impl std::str::FromStr for LinkType {
         match s {
             "Reth" => Ok(LinkType::Reth),
             "Geth" => Ok(LinkType::Geth),
-            _ => Err(
-                eyre::eyre!("Invalid LinkType {}", s)
-            ),
+            _ => Err(eyre::eyre!("Invalid LinkType {}", s)),
         }
     }
 }
