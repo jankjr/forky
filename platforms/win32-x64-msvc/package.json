@@ -1,9 +1,9 @@
 {
-  "name": "@slot0/forky/linux-x64-gnu",
-  "description": "Prebuilt binary package for `@slot0/forky` on `linux-x64-gnu`.",
+  "name": "@slot0/forky/win32-x64-msvc",
+  "description": "Prebuilt binary package for `@slot0/forky` on `win32-x64-msvc`.",
   "version": "0.3.0",
   "os": [
-    "linux"
+    "win32"
   ],
   "cpu": [
     "x64"
@@ -14,11 +14,11 @@
   ],
   "neon": {
     "type": "binary",
-    "rust": "x86_64-unknown-linux-gnu",
-    "node": "linux-x64-gnu",
-    "os": "linux",
+    "rust": "x86_64-pc-windows-msvc",
+    "node": "win32-x64-msvc",
+    "os": "win32",
     "arch": "x64",
-    "abi": "gnu"
+    "abi": "msvc"
   },
   "author": "jan@slot0.io",
   "repository": {

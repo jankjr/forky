@@ -1859,25 +1859,19 @@ dependencies = [
  "alloy",
  "alloy-provider",
  "async_cell",
- "bytes",
  "eyre",
  "futures",
- "hash_hasher",
- "iset",
- "itertools 0.14.0",
  "log",
  "match_deref",
  "neon",
  "once_cell",
  "pretty_env_logger",
  "revm",
- "rustc-hash",
  "scc",
  "sdd",
  "serde",
  "serde_json",
  "tokio",
- "tokio-stream",
 ]
 
 [[package]]
@@ -2056,12 +2050,6 @@ dependencies = [
  "rand_core 0.6.4",
  "subtle",
 ]
-
-[[package]]
-name = "hash_hasher"
-version = "2.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b4b9ebce26001bad2e6366295f64e381c1e9c479109202149b9e15e154973e9"
 
 [[package]]
 name = "hashbrown"
@@ -2457,12 +2445,6 @@ dependencies = [
  "libc",
  "windows-sys 0.59.0",
 ]
-
-[[package]]
-name = "iset"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "855de4169757ca6b92b396d7a0380ef234e9a1ec2ec603c80779453ed0ab45e4"
 
 [[package]]
 name = "itertools"

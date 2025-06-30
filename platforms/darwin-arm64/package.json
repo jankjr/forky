@@ -1,5 +1,5 @@
 {
-  "name": "@forky/darwin-arm64",
+  "name": "@slot0/forky/darwin-arm64",
   "description": "Prebuilt binary package for `@slot0/forky` on `darwin-arm64`.",
   "version": "0.3.0",
   "os": [
