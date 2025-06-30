@@ -1,40 +1,10 @@
-[package]
-name = "forky"
-version = "0.1.0"
-license = "ISC"
-edition = "2021"
-exclude = ["index.node"]
-
-[lib]
-crate-type = ["cdylib"]
+[workspace]
+members = ["crates/forky"]
+resolver = "3"
 
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[dependencies]
-# serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# console-subscriber = "0.4.0"
-neon = { version = "1.1.1", features = ["futures", "napi-experimental", "external-buffers", "tokio"] }
-once_cell = "1"
-tokio = { version = "1.40.0", features = ["tracing", "full"] }
-revm = { version = "26.0.1", features = ["dev", "std", "c-kzg", "secp256k1", "portable", "blst"] }
-bytes = "1.2.1"
-alloy = { version = "1.0.15", features = ["full", "provider-debug-api"] }
-alloy-provider = { version = "1.0.15", features = ["trace-api"] }
-log = "0.4"
-pretty_env_logger = "0.5"
-eyre = "0.6"
-tokio-stream = "0.1.15"
-hash_hasher = "2.0.3"
-futures = "0.3.31"
-rustc-hash = "2.0.0"
-scc = "2.2.1"
-sdd = "3.0.4"
-
-itertools = "0.14.0"
-async_cell = "0.2.2"
-iset = "0.3.0"
-match_deref = "0.1.1"
+[workspace.metadata.cross.target.x86_64-unknown-linux-gnu]
+pre-build = [
+  "dpkg --add-architecture $CROSS_DEB_ARCH",
+  "apt-get update && apt-get --assume-yes install libssl-dev:$CROSS_DEB_ARCH",
+]

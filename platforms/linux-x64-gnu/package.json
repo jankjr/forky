@@ -1,0 +1,30 @@
+{
+  "name": "@forky/linux-x64-gnu",
+  "description": "Prebuilt binary package for `@slot0/forky` on `linux-x64-gnu`.",
+  "version": "0.3.0",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "index.node",
+  "files": [
+    "index.node"
+  ],
+  "neon": {
+    "type": "binary",
+    "rust": "x86_64-unknown-linux-gnu",
+    "node": "linux-x64-gnu",
+    "os": "linux",
+    "arch": "x64",
+    "abi": "gnu"
+  },
+  "author": "jan@slot0.io",
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:jankjr/forky.git"
+  },
+  "keywords": [],
+  "license": "ISC"
+}

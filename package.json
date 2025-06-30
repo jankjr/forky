@@ -5,40 +5,71 @@
     "access": "public",
     "tag": "latest"
   },
+  "main": "./lib/index.cjs",
   "description": "Fast and efficient EVM forks",
   "keywords": [],
-  "module": "./lib.esm/index.js",
   "sideEffects": false,
   "author": "jan@slot0.io",
   "repository": {
     "type": "git",
     "url": "git@github.com:jankjr/forky.git"
   },
-  "main": "index.node",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./lib/index.d.mts",
+        "default": "./lib/index.mjs"
+      },
+      "require": {
+        "types": "./lib/index.d.cts",
+        "default": "./lib/index.cjs"
+      }
+    }
+  },
+  "files": [
+    "lib/**/*.?({c,m}){t,j}s"
+  ],
+  "neon": {
+    "type": "library",
+    "org": "@forky",
+    "platforms": [
+      "darwin-arm64",
+      "linux-x64-gnu"
+    ],
+    "load": "./src/load.cts"
+  },
   "scripts": {
-    "test": "cargo test",
-    "preinstall": "./preinstall.sh",
-    "install": "npm run build",
-    "cargo-build": "cargo build --message-format=json > cargo.log",
-    "cross-build": "cross build --message-format=json > cross.log",
+    "test": "tsc &&cargo test",
+    "cargo-build": "tsc && cargo build --message-format=json-render-diagnostics > cargo.log",
+    "cross-build": "npm run cross-build-linux -- --release && npm run cross-build-darwin -- --release",
+    "cross-build-linux": "tsc && cross build --message-format=json-render-diagnostics --target x86_64-unknown-linux-gnu > cross-x86_64-unknown-linux-gnu.log",
+    "cross-build-darwin": "tsc && cross build --message-format=json-render-diagnostics --target aarch64-apple-darwin > cross-darwin.log",
     "postcargo-build": "neon dist < cargo.log",
-    "postcross-build": "neon dist -m /target < cross.log",
+    "postcross-build": "npm run postcross-build-darwin && npm run postcross-build-linux",
+    "postcross-build-darwin": "neon dist --platform darwin-arm64 --file 'target/aarch64-apple-darwin/release/libforky.dylib'",
+    "postcross-build-linux": "neon dist -m /target --platform linux-x64-gnu < cross-x86_64-unknown-linux-gnu.log",
     "debug": "npm run cargo-build --",
     "build": "npm run cargo-build -- --release",
-    "cross": "npm run cross-build -- --release"
+    "cross": "npm run cross-build -- --release",
+    "prepack": "tsc &&neon update",
+    "version": "neon bump --binaries platforms && git add .",
+    "release": "gh workflow run release.yml -f dryrun=false -f version=patch",
+    "dryrun": "gh workflow run publish.yml -f dryrun=true"
   },
   "type": "commonjs",
-  "types": "types.d.ts",
-  "files": [
-    "index.node",
-    "types.d.ts",
-    "cargo.toml",
-    "cargo.lock",
-    "src/*.rs",
-    "preinstall.sh"
-  ],
+  "types": "./lib/index.d.cts",
   "license": "ISC",
+  "devDependencies": {
+    "@neon-rs/cli": "^0.1.82",
+    "@tsconfig/node20": "^20.1.4",
+    "@types/node": "^20.11.16",
+    "typescript": "^5.3.3"
+  },
   "dependencies": {
-    "@neon-rs/cli": "0.1.82"
+    "@neon-rs/load": "^0.1.82"
+  },
+  "optionalDependencies": {
+    "@forky/linux-x64-gnu": "0.3.0",
+    "@forky/darwin-arm64": "0.3.0"
   }
 }
