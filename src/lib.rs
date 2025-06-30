@@ -1,22 +1,15 @@
 use alloy::eips::BlockId;
 use alloy::hex::FromHex;
-use alloy::rpc::types::AccessList;
-
-use alloy::rpc::types::AccessListItem;
 use alloy_provider::DynProvider;
 use alloy_provider::Provider;
 use neon::prelude::Context;
 use revm::context::result::ExecutionResult;
 use revm::context::TxEnv;
-use revm::interpreter::interpreter_types::InputsTr;
-use revm::interpreter::interpreter_types::Jumps;
 use revm::interpreter::Interpreter;
 use revm::interpreter::InterpreterTypes;
 use revm::primitives::Bytes;
 use revm::primitives::FixedBytes;
-use revm::primitives::Log;
 use revm::state::Bytecode;
-use revm::ExecuteEvm;
 use revm::InspectEvm;
 use revm::MainBuilder;
 use revm::MainContext;
@@ -29,7 +22,6 @@ use neon::prelude::{FunctionContext, ModuleContext, TaskContext};
 use neon::result::{self, JsResult, NeonResult};
 use neon::types::JsArray;
 use neon::types::JsUndefined;
-use neon::types::Value;
 use neon::types::{JsBigInt, JsFunction, JsNumber, JsObject, JsPromise, JsString, JsValue};
 
 use revm::database::CacheDB;
@@ -39,7 +31,6 @@ use revm::DatabaseRef;
 use revm::{primitives::Address};
 
 use once_cell::sync::OnceCell;
-use utils::provider_from_string;
 
 use std::borrow::BorrowMut;
 use std::collections::HashMap;
@@ -48,6 +39,9 @@ use std::{str::FromStr, sync::Arc};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 pub mod utils;
+use utils::*;
+use txrequest::js_obj_tx_to_transaction;
+pub mod txrequest;
 pub mod cannonical;
 pub mod config;
 
@@ -61,19 +55,6 @@ pub const LOGGER_TARGET_LOADS: &str = "forky::sync::loads";
 pub const LOGGER_TARGET_API: &str = "forky::api";
 pub const LOGGER_TARGET_SIMULATION: &str = "forky::sim";
 
-#[derive(Debug, Clone)]
-pub struct TransactionRequest {
-    pub from: Address,
-    pub to: Address,
-    pub data: Vec<u8>,
-    pub value: U256,
-    pub gas_price: Option<U256>,
-    pub gas_priority_fee: Option<U256>,
-    pub max_fee_per_gas: Option<U256>,
-    pub gas_limit: Option<U256>,
-
-    pub access_list: Option<AccessList>
-}
 pub struct ApplicationState {
     pub cannonical: Arc<CannonicalFork>,
     pub preload: Arc<HashSet<Address>>,
@@ -81,34 +62,6 @@ pub struct ApplicationState {
     pub config: Config,
 }
 
-fn bigint_to_u256<'a>(
-    value: Handle<'a, JsBigInt>,
-    cx: &mut FunctionContext<'a>,
-) -> neon::result::NeonResult<revm::primitives::U256> {
-    let decimal = value.to_string(cx)?.value(cx);
-    let o = match U256::from_str_radix(&decimal, 10) {
-        std::result::Result::Ok(v) => v,
-        Err(e) => {
-            return cx.throw_error(e.to_string());
-        }
-    };
-
-
-    std::result::Result::Ok(o)
-}
-
-
-const DEFAULT_SLOTS: [revm::primitives::U256; 3] = [
-   revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!(
-        "7050c9e0f4ca769c69bd3a8ef740bc37934f8e2c036e5a723fd8ee048ed3f8c3"
-    )),
-    revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!(
-        "360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
-    )),
-    revm::primitives::U256::from_be_slice(&revm::primitives::hex_literal::hex!(
-        "10d6a54a4754c8869d6886b5f5d7fbfa5b4522237ea5c60d11bc4e7a1ff9390b"
-    ))
-];
 impl ApplicationState {
     pub async fn create(
         config: Config,
@@ -292,126 +245,6 @@ async fn init_application_state(config: Config) -> eyre::Result<ApplicationState
     Ok(Arc::new(app_state))
 }
 
-fn to_neon<'a, T, C: Context<'a>>(cx: &mut C, e: eyre::Result<T>) -> neon::result::NeonResult<T> {
-    match e {
-        eyre::Result::Ok(v) => neon::result::NeonResult::Ok(v),
-        eyre::Result::Err(e) => cx.throw_error(e.to_string()),
-    }
-}
-
-fn js_value_to_address<'a>(
-    cx: &mut neon::context::FunctionContext<'a>,
-    js_val: Handle<'a, JsValue>,
-) -> neon::result::NeonResult<Address> {
-    use eyre::WrapErr;
-    let down_casted = js_val.to_string(cx)?;
-    let out = Address::from_str(down_casted.value(cx).as_str());
-    to_neon(cx, out.wrap_err("Failed to parse"))
-}
-
-fn js_value_to_bytes<'a>(
-    cx: &mut neon::context::FunctionContext<'a>,
-    js_val: Handle<'a, JsValue>,
-) -> neon::result::NeonResult<Vec<u8>> {
-    use eyre::WrapErr;
-    let down_casted = js_val.to_string(cx)?;
-    let out = hex::decode(down_casted.value(cx).as_str()).wrap_err("Failed to parse");
-    to_neon(cx, out)
-}
-
-fn js_value_to_uint256<'a>(
-    cx: &mut neon::context::FunctionContext<'a>,
-    js_val: Handle<'a, JsValue>,
-) -> neon::result::NeonResult<revm::primitives::U256> {
-    let down_casted: Handle<'a, JsBigInt> =
-        js_val.downcast_or_throw::<JsBigInt, neon::context::FunctionContext<'a>>(cx)?;
-    bigint_to_u256(down_casted, cx)
-}
-fn js_value_to_b256<'a>(
-    cx: &mut neon::context::FunctionContext<'a>,
-    js_val: Handle<'a, JsValue>,
-) -> neon::result::NeonResult<revm::primitives::B256> {
-    use eyre::WrapErr;
-    let down_casted: Handle<'a, JsString> =
-        js_val.downcast_or_throw::<JsString, neon::context::FunctionContext<'a>>(cx)?;
-    let value = down_casted.value(cx);
-    let out = revm::primitives::B256::from_str(
-        &value
-    );
-    
-    to_neon(cx, out.wrap_err("Failed to parse"))
-}
-fn get_optional_bigint<'a>(
-    js_val: NeonResult<Option<Handle<'a, JsBigInt>>>,
-    cx: &mut neon::context::FunctionContext<'a>,
-) -> neon::result::NeonResult<Option<revm::primitives::U256>> {
-    match js_val {
-        eyre::Result::Ok(Some(v)) => match bigint_to_u256(v, cx) {
-            eyre::Result::Ok(v) => NeonResult::Ok(Some(v)),
-            Err(e) => cx.throw_error(e.to_string()),
-        },
-        eyre::Result::Ok(None) => NeonResult::Ok(None),
-        Err(e) => cx.throw_error(e.to_string()),
-    }
-}
-
-fn js_obj_tx_to_transaction<'a>(
-    mut cx: FunctionContext<'a>,
-    js_obj_tx: Handle<JsObject>,
-) -> neon::result::NeonResult<TransactionRequest> {
-    let from = js_obj_tx.get_value(&mut cx, "from")?;
-    let to = js_obj_tx.get_value(&mut cx, "to")?;
-    let data = js_obj_tx.get_value(&mut cx, "data")?;
-    let gas_price = get_optional_bigint(js_obj_tx.get_opt::<JsBigInt, _, _>(&mut cx, "gasPrice"), &mut cx)?;
-    let gas_limit = get_optional_bigint(js_obj_tx.get_opt::<JsBigInt, _, _>(&mut cx, "gasLimit"), &mut cx)?;
-
-    let gas_priority_fee = get_optional_bigint(js_obj_tx.get_opt::<JsBigInt, _, _>(&mut cx, "maxPriorityFeePerGas"), &mut cx)?;
-    let max_fee_per_gas = get_optional_bigint(js_obj_tx.get_opt::<JsBigInt, _, _>(&mut cx, "maxFeePerGas"), &mut cx)?;
-    let value = get_optional_bigint(js_obj_tx.get_opt::<JsBigInt, _, _>(&mut cx, "value"), &mut cx)?.unwrap_or_default();
-
-    let access_list = if let Some(v) = js_obj_tx.get_opt::<JsArray, _, _>(&mut cx, "accessList")? {
-        let mut out = Vec::new();
-        let length = v.len(&mut cx);
-        for i in 0..length {
-            let item: Handle<JsObject> = v.get(&mut cx, i)?;
-            let address = item.get(&mut cx, "address")?;
-            let address = js_value_to_address(&mut cx, address)?;
-            let storage_keys = item.get::<JsArray, _, _>(&mut cx, "storageKeys").map(|v|{
-                let mut out = Vec::new();
-                let length = v.len(&mut cx);
-                for i in 0..length {
-                    let item = v.get::<>(&mut cx, i)?;
-                    let item = js_value_to_b256(&mut cx, item)?;
-                    out.push(item);
-                }
-                neon::result::NeonResult::Ok(out)
-            })??;
-            
-            out.push(AccessListItem {
-                address,
-                storage_keys: storage_keys
-            });
-        }
-        Some(AccessList(out))
-    } else {
-        None
-    };
-    let from = js_value_to_address(&mut cx, from)?;
-    let to = js_value_to_address(&mut cx, to)?;
-    let data = js_value_to_bytes(&mut cx, data)?;
-    neon::result::NeonResult::Ok(TransactionRequest {
-        from,
-        to,
-        data,
-        value,
-        gas_limit,
-        gas_price,
-        gas_priority_fee,
-        max_fee_per_gas,
-        access_list
-    })
-}
-
 struct LogTracer {
     pub memory_reads: HashMap<Address, std::collections::HashSet<U256>>,
     pub logs: Vec<(
@@ -482,6 +315,7 @@ fn instantiate_js_log<'a>(
 
     JsResult::Ok(js_log)
 }
+
 fn instantiate_run_tx<'a>(
     cx: &mut TaskContext<'a>,
     app_state: ApplicationStateRef,
