@@ -1,6 +1,6 @@
 {
   "name": "@slot0/forky",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "publishConfig": {
     "access": "public",
     "tag": "latest"
@@ -54,7 +54,6 @@
     "debug": "npm run cargo-build --",
     "build": "npm run cargo-build -- --release",
     "cross": "npm run cross-build -- --release",
-    "prepack": "tsc &&neon update",
     "version": "neon bump --binaries platforms && git add .",
     "release": "gh workflow run release.yml -f dryrun=false -f version=patch",
     "dryrun": "gh workflow run publish.yml -f dryrun=true"
@@ -70,10 +69,5 @@
   },
   "dependencies": {
     "@neon-rs/load": "^0.1.82"
-  },
-  "optionalDependencies": {
-    "@slot0/forky/darwin-arm64": "0.3.0",
-    "@slot0/forky/linux-x64-gnu": "0.3.0",
-    "@slot0/forky/win32-x64-msvc": "0.3.0"
   }
 }

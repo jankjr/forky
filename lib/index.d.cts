@@ -18,7 +18,7 @@ export interface Log {
     topics: string[];
     data: string;
 }
-interface SimReceipt {
+export interface SimReceipt {
     logs: Log[];
     cumulativeGasUsed: bigint;
     gasUsed: bigint;
@@ -30,7 +30,7 @@ export interface SimResult {
     execResult: ExecutionResult;
     accessList: AccessList;
 }
-interface SimTransactionRequest {
+export interface SimTransactionRequest {
     from: string;
     to: string;
     data: string;
@@ -95,4 +95,3 @@ export declare function createSimulator(stateProvider: string, linkType: LinkTyp
     traceProvider?: string;
     maxBlocksBehind?: number;
 }): Promise<ForkySimulator>;
-export {};
