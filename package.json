@@ -1,6 +1,6 @@
 {
   "name": "@slot0/forky",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "publishConfig": {
     "access": "public",
     "tag": "latest"
@@ -35,21 +35,24 @@
     "org": "@slot0/forky",
     "platforms": [
       "darwin-arm64",
-      "linux-x64-gnu"
+      "linux-x64-gnu",
+      "linux-x64-musl"
     ],
     "load": "./src/load.cts"
   },
   "scripts": {
     "test": "tsc &&cargo test",
     "cargo-build": "tsc && cargo build --message-format=json-render-diagnostics > cargo.log",
-    "cross-build": "npm run cross-build-linux && npm run cross-build-darwin",
-    "cross-build-linux": "tsc && cross build --message-format=json-render-diagnostics --target x86_64-unknown-linux-gnu --release > cross-x86_64-unknown-linux-gnu.log",
+    "cross-build": "npm run cross-build-linux-gnu && npm run cross-build-darwin",
+    "cross-build-linux-gnu": "tsc && cross build --message-format=json-render-diagnostics --target x86_64-unknown-linux-gnu --release > cross-x86_64-unknown-linux-gnu.log",
+    "cross-build-linux-musl": "tsc && RUSTFLAGS='-C target-feature=-crt-static' cross build --message-format=json-render-diagnostics --target x86_64-unknown-linux-musl --release > cross-x86_64-unknown-linux-musl.log",
     "cross-build-darwin": "tsc && cross build --message-format=json-render-diagnostics --target aarch64-apple-darwin --release > cross-darwin.log",
     "cross-build-win32": "tsc && cross build --message-format=json-render-diagnostics --target x86_64-pc-windows-msvc --release > cross-win32.log",
     "postcargo-build": "neon dist < cargo.log",
-    "postcross-build": "npm run postcross-build-darwin && npm run postcross-build-linux",
+    "postcross-build": "npm run postcross-build-darwin && npm run postcross-build-linux-gnu && npm run postcross-build-linux-musl",
     "postcross-build-darwin": "neon dist --platform darwin-arm64 --file 'target/aarch64-apple-darwin/release/libforky.dylib'",
-    "postcross-build-linux": "neon dist -m /target --platform linux-x64-gnu < cross-x86_64-unknown-linux-gnu.log",
+    "postcross-build-linux-gnu": "neon dist -m /target --platform linux-x64-gnu < cross-x86_64-unknown-linux-gnu.log",
+    "postcross-build-linux-musl": "neon dist -m /target --platform linux-x64-musl < cross-x86_64-unknown-linux-musl.log",
     "postcross-build-win32": "neon dist -m /target --platform win32-x64-msvc < cross-win32.log",
     "debug": "npm run cargo-build --",
     "build": "npm run cargo-build -- --release",

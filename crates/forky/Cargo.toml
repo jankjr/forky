@@ -9,6 +9,7 @@ exclude = ["index.node"]
 [lib]
 crate-type = ["cdylib"]
 
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -34,3 +35,4 @@ sdd = "3.0.4"
 async_cell = "0.2.2"
 # iset = "0.3.0"
 match_deref = "0.1.1"
+openssl = { version = "0.10", features = ["vendored"] }

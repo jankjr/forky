@@ -8,8 +8,9 @@
 module.exports = require("@neon-rs/load").proxy({
   platforms: {
     "darwin-arm64": () => require("../platforms/darwin-arm64"),
-    "linux-x64-gnu": () => require("../platforms/linux-x64-gnu"),
     // "win32-x64-msvc": () => require("../platforms/win32-x64-msvc"),
+    "linux-x64-gnu": () => require("../platforms/linux-x64-gnu"),
+    "linux-x64-musl": () => require("../platforms/linux-x64-musl"),
   },
   debug: () => require("../index.node"),
 });
